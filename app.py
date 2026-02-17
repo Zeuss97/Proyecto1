@@ -678,7 +678,7 @@ def render_page(
 
     body_rows = "".join(lines) if lines else '<tr><td colspan="8" class="empty">No hay IPs para el filtro seleccionado</td></tr>'
     register_panel = ""
-    if user["role"] == ROLE_ADMIN:
+    if user["role"] in {ROLE_ADMIN, ROLE_OPERATOR}:
         register_panel = """
 <section class="panel"><h2>Registrar IP</h2>
 <form action="/register" method="post" class="form-grid">
