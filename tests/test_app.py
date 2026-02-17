@@ -123,3 +123,8 @@ def test_host_details_can_be_updated():
     assert row["host_type"] == "NOTEBOOK"
     assert row["location"] == "INF"
     assert row["notes"] == "Equipo de pruebas"
+
+
+def test_format_last_ping_shows_datetime_without_timezone_suffix():
+    assert app._format_last_ping("2026-02-17T19:13:33.491648+00:00") == "2026-02-17 19:13:33"
+    assert app._format_last_ping(None) == "Nunca"

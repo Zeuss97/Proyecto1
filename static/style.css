@@ -107,6 +107,16 @@ table {
   border-collapse: collapse;
 }
 
+
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.table-wrap table {
+  min-width: 900px;
+}
+
 th,
 td {
   border-bottom: 1px solid #2f2f2f;

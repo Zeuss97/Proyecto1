@@ -19,7 +19,15 @@ Aplicación web para:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+En **Windows PowerShell**:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
 ## Ejecución
@@ -63,3 +71,7 @@ Coloca tu imagen en:
 - En Linux/macOS se usa `ping -c 1` y DNS inversa.
 - El ping automático corre cada 30 minutos (`PING_INTERVAL_SECONDS = 30 * 60`).
 - Cada intento de ping queda guardado y se conserva por 7 días (`PING_LOG_RETENTION_DAYS`).
+
+
+- No hace falta compilar HTML manualmente: `index` se genera desde el backend al entrar a `/`.
+- Si visitas `/ping-now` en el navegador, ahora redirige automáticamente al inicio para evitar el 404.

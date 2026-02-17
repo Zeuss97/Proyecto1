@@ -124,6 +124,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_last_ping(value: str | None) -> str:
+    if not value:
+        return "Nunca"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _hash_password(password: str, salt: str | None = None) -> str:
     raw_salt = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), raw_salt, 200_000)
@@ -670,13 +680,12 @@ def render_page(
             f"<td>{details}</td>"
             f"<td>{html.escape(row['hostname'] or '-')}</td>"
             f"<td>{html.escape(row['last_status'] or 'Sin ejecutar')}</td>"
-            f"<td>{html.escape(row['last_ping_at'] or 'Nunca')}</td>"
-            f"<td><pre>{html.escape(row['last_output'] or '-')}</pre></td>"
+            f"<td>{html.escape(_format_last_ping(row['last_ping_at']))}</td>"
             f"<td><div class='actions'><a class='btn-link' href='/edit?ip={html.escape(row['ip_address'] or '')}'>Editar host</a><a class='btn-link' href='/logs?ip={html.escape(row['ip_address'] or '')}'>Ver registros</a></div></td>"
             "</tr>"
         )
 
-    body_rows = "".join(lines) if lines else '<tr><td colspan="8" class="empty">No hay IPs para el filtro seleccionado</td></tr>'
+    body_rows = "".join(lines) if lines else '<tr><td colspan="7" class="empty">No hay IPs para el filtro seleccionado</td></tr>'
     register_panel = ""
     if user["role"] == ROLE_ADMIN:
         register_panel = """
@@ -701,8 +710,8 @@ def render_page(
 <button type=\"submit\">Aplicar filtro</button>
 <a href=\"/\" class=\"btn-link\">Limpiar</a>
 </form>{applied_badge}
-<table><thead><tr><th>Segmento</th><th>IP</th><th>Detalles host</th><th>Hostname</th><th>Último estado</th><th>Último ping</th><th>Salida</th><th>Acciones</th></tr></thead>
-<tbody>{body_rows}</tbody></table></section></main></body></html>"""
+<div class="table-wrap"><table><thead><tr><th>Segmento</th><th>IP</th><th>Detalles host</th><th>Hostname</th><th>Último estado</th><th>Último ping</th><th>Acciones</th></tr></thead>
+<tbody>{body_rows}</tbody></table></div></section></main></body></html>"""
 
 
 def render_edit_page(
@@ -885,6 +894,10 @@ class Handler(BaseHTTPRequestHandler):
             raw_filter = text or pick
             segment_filter = normalize_segment_filter(raw_filter)
             self._respond_html(render_page(user=user, segment_filter=segment_filter, raw_filter=raw_filter))
+            return
+
+        if parsed.path == "/ping-now":
+            self._redirect("/")
             return
 
         if parsed.path == "/edit":
