@@ -14,6 +14,60 @@ def setup_module():
     app.init_db()
 
 
+def test_demo_admin_exists_by_default():
+    assert app.authenticate_user("admin", "admin") is True
+    admin = app.get_user_by_username("admin")
+    assert admin is not None
+    assert admin["role"] == app.ROLE_ADMIN
+
+
+def test_admin_can_create_and_delete_operator():
+    ok, msg = app.create_user_by_admin("operador1", "secreto", "operator", "Ope", "Uno", "")
+    assert ok is True
+    assert "creado" in msg
+    assert app.authenticate_user("operador1", "secreto") is True
+
+    ok_del, msg_del = app.admin_delete_user("operador1", acting_username="admin")
+    assert ok_del is True
+    assert "eliminado" in msg_del
+
+
+def test_operator_cannot_delete_self_logic_guard():
+    app.create_user_by_admin("operador2", "secreto", "operator")
+    ok, msg = app.admin_delete_user("operador2", acting_username="operador2")
+    assert ok is False
+    assert "propio" in msg
+
+
+def test_profile_can_change_username_and_names():
+    app.create_user_by_admin("operador3", "secreto", "operator")
+    ok, msg, new_username = app.update_profile("operador3", "ope3", "Ana", "Gomez", "https://example.com/a.jpg")
+    assert ok is True
+    assert "actualizado" in msg
+    assert new_username == "ope3"
+
+    row = app.get_user_by_username("ope3")
+    assert row is not None
+    assert row["first_name"] == "Ana"
+    assert row["last_name"] == "Gomez"
+
+
+
+def test_ping_logs_saved_and_pruned():
+    app.register_ip("10.0.0.50", "imp")
+
+    with app.get_connection() as conn:
+        recent = app._now_iso()
+        old = "2000-01-01T00:00:00+00:00"
+        app._record_ping_log(conn, "10.0.0.50", "host-a", "OK", "todo bien", recent)
+        app._record_ping_log(conn, "10.0.0.50", "host-a", "ERROR", "sin respuesta", old)
+        app._prune_old_ping_logs(conn)
+        conn.commit()
+
+    logs = app.get_ping_logs_for_ip("10.0.0.50")
+    assert len(logs) == 1
+    assert logs[0]["status"] == "OK"
+
 def test_invalid_ip_is_rejected():
     ok, msg = app.register_ip("not-an-ip", "x")
     assert ok is False

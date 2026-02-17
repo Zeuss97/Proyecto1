@@ -1,13 +1,13 @@
 # Registro de IPs con monitoreo de ping
 
-Aplicación web simple para:
+Aplicación web para:
 
-- Registrar direcciones IP (con alias opcional).
-- Ejecutar ping automáticamente cada 12 horas a todas las IPs registradas.
-- Guardar resultado del ping y la fecha/hora del último intento.
-- Resolver hostname (equivalente práctico a `ping -a`) para identificar el nombre del equipo cuando sea posible.
-- Filtrar IPs por segmento /24 (por ejemplo `192.168.56.0/24` o formato corto `56/24`).
-- Editar cada host con detalles: nombre, tipo de equipo, ubicación, alias y notas adicionales.
+- Registrar direcciones IP y monitorear ping cada 30 minutos.
+- Editar datos de cada host (nombre, tipo, ubicación, alias y notas).
+- Consultar historial de intentos de ping de los últimos 7 días por cada IP.
+- Acceso con usuarios y roles (`admin` / `operator`).
+- Gestión interna de usuarios desde un panel admin.
+- Perfil de usuario para actualizar nombre, apellido, userID y foto (URL).
 
 ## Requisitos
 
@@ -28,15 +28,38 @@ pip install -r requirements.txt
 python app.py
 ```
 
-La app queda disponible en `http://localhost:5000`.
+Disponible en `http://localhost:5000`.
+
+## Acceso inicial demo
+
+- Usuario: `admin`
+- Contraseña: `admin`
+
+Ese usuario demo se crea automáticamente al iniciar (si no existe) y puedes desactivarlo con:
+
+```bash
+DEMO_ADMIN_ENABLED=0 python app.py
+```
+
+## Roles
+
+- **Admin**
+  - Puede crear y eliminar usuarios.
+  - Puede editar cualquier usuario (rol, userID, nombre, apellido, foto y contraseña opcional).
+  - Puede registrar nuevas IPs.
+- **Operador**
+  - Puede consultar y modificar IPs existentes.
+  - No puede crear/eliminar usuarios ni registrar IPs nuevas.
+
+## Personalizar fondo del login
+
+Coloca tu imagen en:
+
+- `static/login-background.jpg`
 
 ## Notas
 
-- En Windows se usa `ping -a` directamente.
-- En Linux/macOS se usa `ping -c 1` y resolución DNS inversa (`socket.gethostbyaddr`) para obtener el hostname.
-- El intervalo está configurado en 12 horas (`PING_INTERVAL_SECONDS`).
-- También puedes lanzar el ping manualmente desde el botón **Ejecutar ping ahora**.
-
-- El filtro por segmento permite separar fácilmente rangos como 56/24 y 59/24.
-
-- Cada IP tiene un botón **Editar host** para modificar sus datos en cualquier momento.
+- En Windows se usa `ping -a`.
+- En Linux/macOS se usa `ping -c 1` y DNS inversa.
+- El ping automático corre cada 30 minutos (`PING_INTERVAL_SECONDS = 30 * 60`).
+- Cada intento de ping queda guardado y se conserva por 7 días (`PING_LOG_RETENTION_DAYS`).
