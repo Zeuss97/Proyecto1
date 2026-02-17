@@ -49,7 +49,7 @@ DEMO_ADMIN_ENABLED=0 python app.py
   - Puede registrar nuevas IPs.
 - **Operador**
   - Puede consultar y modificar IPs existentes.
-  - No puede crear/eliminar usuarios ni registrar IPs nuevas.
+  - No puede crear ni eliminar usuarios.
 
 ## Personalizar fondo del login
 

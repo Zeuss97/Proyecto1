@@ -975,8 +975,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/register":
-            if user["role"] != ROLE_ADMIN:
-                self._respond_html(render_page(user=user, message="Solo admin puede registrar IPs", category="error"))
+            if user["role"] not in {ROLE_ADMIN, ROLE_OPERATOR}:
+                self._respond_html(render_page(user=user, message="No tienes permisos para registrar IPs", category="error"))
                 return
             ip_address = form.get("ip_address", [""])[0]
             alias = form.get("alias", [""])[0]
