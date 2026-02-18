@@ -235,6 +235,34 @@ function normalize_segment_filter(string $input): ?string
     return null;
 }
 
+function resolve_scan_segment_prefix(string $input): ?string
+{
+    $raw = trim($input);
+    if ($raw === '') {
+        return null;
+    }
+
+    if (preg_match('/^(\d{1,3})$/', $raw, $m) || preg_match('/^(\d{1,3})\/24$/', $raw, $m)) {
+        $octet = (int) $m[1];
+        if ($octet >= 0 && $octet <= 255) {
+            return '192.168.' . $octet;
+        }
+    }
+
+    if (preg_match('/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/', $raw, $m)
+        || preg_match('/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0\/24$/', $raw, $m)) {
+        foreach ([1, 2, 3] as $idx) {
+            $value = (int) $m[$idx];
+            if ($value < 0 || $value > 255) {
+                return null;
+            }
+        }
+        return sprintf('%d.%d.%d', $m[1], $m[2], $m[3]);
+    }
+
+    return null;
+}
+
 function compute_segment(string $ip): string
 {
     $parts = explode('.', $ip);
@@ -483,6 +511,81 @@ if ($action === 'add_ip') {
         flash('La IP ya existe.', 'error');
     }
     redirect('index.php?view=ips');
+}
+
+if ($action === 'scan_segment') {
+    if (!in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)) {
+        flash('No tienes permisos para escanear segmentos.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $segmentInput = trim((string) ($_POST['segment_scan'] ?? ''));
+    $prefix = resolve_scan_segment_prefix($segmentInput);
+    if ($prefix === null) {
+        flash('Segmento inválido. Usa por ejemplo 56, 56/24 o 192.168.56.0/24.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $foundOnline = 0;
+    $inserted = 0;
+    $updated = 0;
+
+    for ($host = 1; $host <= 254; $host++) {
+        $ip = $prefix . '.' . $host;
+        $result = ping_ip($ip);
+        if ($result['status'] !== 'OK') {
+            continue;
+        }
+
+        $foundOnline++;
+        $timestamp = now_iso();
+        $uptime = probe_uptime($ip);
+
+        try {
+            $insert = db()->prepare('INSERT INTO ip_registry (
+                ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, last_status, last_output, last_uptime, created_at, created_by
+            ) VALUES (
+                :ip_address, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
+            )');
+            $insert->execute([
+                'ip_address' => $ip,
+                'alias' => '',
+                'host_name' => $result['hostname'] ?? '',
+                'location' => '',
+                'last_ping_at' => $timestamp,
+                'last_seen_online_at' => $timestamp,
+                'last_status' => $result['status'],
+                'last_output' => $result['output'],
+                'last_uptime' => $uptime,
+                'created_at' => $timestamp,
+                'created_by' => $user['username'],
+            ]);
+            $inserted++;
+        } catch (PDOException) {
+            $update = db()->prepare('UPDATE ip_registry SET
+                last_ping_at = :last_ping_at,
+                last_seen_online_at = :last_seen_online_at,
+                last_status = :last_status,
+                last_output = :last_output,
+                last_uptime = COALESCE(:last_uptime, last_uptime),
+                host_name = COALESCE(NULLIF(host_name, ""), :host_name)
+                WHERE ip_address = :ip_address');
+            $update->execute([
+                'last_ping_at' => $timestamp,
+                'last_seen_online_at' => $timestamp,
+                'last_status' => $result['status'],
+                'last_output' => $result['output'],
+                'last_uptime' => $uptime,
+                'host_name' => $result['hostname'] ?? '',
+                'ip_address' => $ip,
+            ]);
+            $updated++;
+        }
+    }
+
+    flash(sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $foundOnline, $inserted, $updated), 'success');
+    $segmentOctet = explode('.', $prefix)[2] ?? '';
+    redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
 
 if ($action === 'save_ip') {
@@ -902,6 +1005,18 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <label>Ubicación<input type="text" name="location"></label>
                 <div class="form-end"><button type="submit" class="btn primary small">Registrar</button></div>
             </form>
+        </details>
+
+        <details class="card collapsible-card" open>
+            <summary><h2>Escanear segmento (/24)</h2></summary>
+            <form method="post" class="form-grid three">
+                <input type="hidden" name="action" value="scan_segment" />
+                <label>Segmento
+                    <input type="text" name="segment_scan" required placeholder="Ej: 56, 56/24 o 192.168.56.0/24">
+                </label>
+                <div class="form-end"><button type="submit" class="btn small">Escanear e importar IPs online</button></div>
+            </form>
+            <div class="muted">Escanea hosts 1..254 del segmento y registra/actualiza las IPs que respondan ping.</div>
         </details>
         <?php endif; ?>
 
