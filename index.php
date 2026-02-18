@@ -39,6 +39,21 @@ function now_iso(): string
     return (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format(DateTimeInterface::ATOM);
 }
 
+function iso_after_seconds(int $seconds): string
+{
+    $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    if ($seconds >= 0) {
+        return $now->add(new DateInterval('PT' . $seconds . 'S'))->format(DateTimeInterface::ATOM);
+    }
+    return $now->sub(new DateInterval('PT' . abs($seconds) . 'S'))->format(DateTimeInterface::ATOM);
+}
+
+function next_auto_ping_iso(): string
+{
+    $jitter = random_int(-300, 300);
+    return iso_after_seconds(1800 + $jitter);
+}
+
 function format_display_datetime(?string $value): string
 {
     $raw = trim((string) $value);
@@ -83,6 +98,7 @@ function init_db(): void
         notes TEXT,
         last_ping_at TEXT,
         last_seen_online_at TEXT,
+        next_auto_ping_at TEXT,
         last_status TEXT,
         last_output TEXT,
         last_uptime TEXT,
@@ -100,6 +116,9 @@ function init_db(): void
     }
     if (!in_array('last_seen_online_at', $columnNames, true)) {
         $pdo->exec('ALTER TABLE ip_registry ADD COLUMN last_seen_online_at TEXT');
+    }
+    if (!in_array('next_auto_ping_at', $columnNames, true)) {
+        $pdo->exec('ALTER TABLE ip_registry ADD COLUMN next_auto_ping_at TEXT');
     }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ping_logs (
@@ -361,6 +380,7 @@ function run_ping_for_ip(string $ip): void
     $update = db()->prepare('UPDATE ip_registry
         SET last_ping_at = :last_ping_at, last_status = :last_status, last_output = :last_output,
             last_seen_online_at = COALESCE(:last_seen_online_at, last_seen_online_at),
+            next_auto_ping_at = :next_auto_ping_at,
             last_uptime = COALESCE(:last_uptime, last_uptime),
             host_name = COALESCE(NULLIF(host_name, ""), :host_name)
         WHERE ip_address = :ip_address');
@@ -369,6 +389,7 @@ function run_ping_for_ip(string $ip): void
         'last_status' => $result['status'],
         'last_output' => $result['output'],
         'last_seen_online_at' => $lastSeenOnlineAt,
+        'next_auto_ping_at' => next_auto_ping_iso(),
         'last_uptime' => $uptime,
         'host_name' => $result['hostname'],
         'ip_address' => $ip,
@@ -387,6 +408,71 @@ function run_ping_for_ip(string $ip): void
     $prune = db()->prepare('DELETE FROM ping_logs WHERE pinged_at < :limit');
     $limit = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->sub(new DateInterval('P7D'))->format(DateTimeInterface::ATOM);
     $prune->execute(['limit' => $limit]);
+}
+
+function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
+{
+    $timestamp = now_iso();
+    $uptime = probe_uptime($ip);
+    try {
+        $insert = db()->prepare('INSERT INTO ip_registry (
+            ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
+        ) VALUES (
+            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :next_auto_ping_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
+        )');
+        $insert->execute([
+            'ip_address' => $ip,
+            'alias' => '',
+            'host_name' => $result['hostname'] ?? '',
+            'location' => '',
+            'last_ping_at' => $timestamp,
+            'last_seen_online_at' => $timestamp,
+            'next_auto_ping_at' => next_auto_ping_iso(),
+            'last_status' => $result['status'],
+            'last_output' => $result['output'],
+            'last_uptime' => $uptime,
+            'created_at' => $timestamp,
+            'created_by' => $createdBy,
+        ]);
+        return 'inserted';
+    } catch (PDOException) {
+        $update = db()->prepare('UPDATE ip_registry SET
+            last_ping_at = :last_ping_at,
+            last_seen_online_at = :last_seen_online_at,
+            next_auto_ping_at = :next_auto_ping_at,
+            last_status = :last_status,
+            last_output = :last_output,
+            last_uptime = COALESCE(:last_uptime, last_uptime),
+            host_name = COALESCE(NULLIF(host_name, ""), :host_name)
+            WHERE ip_address = :ip_address');
+        $update->execute([
+            'last_ping_at' => $timestamp,
+            'last_seen_online_at' => $timestamp,
+            'next_auto_ping_at' => next_auto_ping_iso(),
+            'last_status' => $result['status'],
+            'last_output' => $result['output'],
+            'last_uptime' => $uptime,
+            'host_name' => $result['hostname'] ?? '',
+            'ip_address' => $ip,
+        ]);
+        return 'updated';
+    }
+}
+
+function run_due_auto_pings(int $limit = 1): void
+{
+    $stmt = db()->prepare('SELECT ip_address FROM ip_registry
+        WHERE next_auto_ping_at IS NULL OR next_auto_ping_at <= :now
+        ORDER BY COALESCE(next_auto_ping_at, "") ASC
+        LIMIT :limit');
+    $stmt->bindValue(':now', now_iso(), PDO::PARAM_STR);
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->execute();
+    $rows = $stmt->fetchAll();
+
+    foreach ($rows as $row) {
+        run_ping_for_ip($row['ip_address']);
+    }
 }
 
 function list_wallpapers(): array
