@@ -73,8 +73,65 @@ body:not(.login-page)::before {
     margin-top: 0;
     z-index: 25;
 }
-.settings-panel h3 { margin: 0 0 10px; }
-.settings-panel h3 + form { margin-bottom: 14px; }
+
+.menu-panel {
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+
+.menu-subgroup {
+    border-top: 1px solid var(--border);
+}
+
+.menu-subgroup:first-child {
+    border-top: 0;
+}
+
+.menu-subgroup > summary {
+    cursor: pointer;
+    padding: 10px 12px;
+    font-weight: 700;
+    background: color-mix(in srgb, var(--surface) 75%, transparent);
+}
+
+.menu-subcontent {
+    padding: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.menu-link {
+    display: inline-flex;
+    text-decoration: none;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.users-list {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+}
+
+.user-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.user-row:last-child {
+    border-bottom: 0;
+}
 
 .card {
     margin-top: 16px;
@@ -166,6 +223,10 @@ th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: 
 .modal-card {
     max-width: 1080px;
     margin: 0 auto 14px;
+}
+
+.create-user-modal {
+    max-width: 760px;
 }
 
 @media (max-width: 920px) {

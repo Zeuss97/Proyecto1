@@ -62,8 +62,15 @@ function init_db(): void
         last_ping_at TEXT,
         last_status TEXT,
         last_output TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        created_by TEXT
     )');
+
+    $columns = $pdo->query('PRAGMA table_info(ip_registry)')->fetchAll();
+    $columnNames = array_column($columns, 'name');
+    if (!in_array('created_by', $columnNames, true)) {
+        $pdo->exec('ALTER TABLE ip_registry ADD COLUMN created_by TEXT');
+    }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ping_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,8 +364,14 @@ if ($action === 'add_ip') {
     $alias = trim((string) ($_POST['alias'] ?? ''));
 
     try {
-        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, created_at) VALUES (:ip_address, :alias, :created_at)');
-        $stmt->execute(['ip_address' => $ip, 'alias' => $alias, 'created_at' => now_iso()]);
+        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, created_at, created_by)
+            VALUES (:ip_address, :alias, :created_at, :created_by)');
+        $stmt->execute([
+            'ip_address' => $ip,
+            'alias' => $alias,
+            'created_at' => now_iso(),
+            'created_by' => $user['username'],
+        ]);
         flash('IP registrada.', 'success');
     } catch (PDOException) {
         flash('La IP ya existe.', 'error');
@@ -493,6 +506,11 @@ $wallpapers = list_wallpapers();
 $selectedWallpaper = $_SESSION['wallpaper'] ?? '';
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
+$usersList = [];
+if ($user['role'] === ROLE_ADMIN) {
+    $usersList = db()->query('SELECT username, role, first_name, last_name FROM users ORDER BY username')->fetchAll();
+}
+$showCreateUserModal = $user['role'] === ROLE_ADMIN && (($_GET['modal'] ?? '') === 'create_user');
 ?>
 <!doctype html>
 <html lang="es" data-theme="<?= h($theme) ?>">
@@ -513,39 +531,47 @@ $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '
             <span class="pill">Perfil (<?= h($displayName) ?>)</span>
             <form method="post"><input type="hidden" name="action" value="toggle_theme"><button class="btn">Modo <?= $theme === 'light' ? 'nocturno' : 'claro' ?></button></form>
             <details class="settings-menu">
-                <summary class="btn">Menú</summary>
-                <div class="settings-panel card">
-                    <h3>Personalizar fondo de login</h3>
-                    <form method="post" class="form-grid compact">
-                        <input type="hidden" name="action" value="set_wallpaper" />
-                        <label>
-                            Wallpaper (carpeta <code>wallpaper/</code>)
-                            <select name="wallpaper">
-                                <option value="">Sin imagen</option>
-                                <?php foreach ($wallpapers as $wall): ?>
-                                    <option value="<?= h($wall) ?>" <?= $selectedWallpaper === $wall ? 'selected' : '' ?>><?= h(basename($wall)) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </label>
-                        <button type="submit" class="btn">Aplicar fondo</button>
-                    </form>
+                <summary class="btn">Mantenimiento</summary>
+                <div class="settings-panel menu-panel">
+                    <details class="menu-subgroup">
+                        <summary>Personalización</summary>
+                        <div class="menu-subcontent">
+                            <form method="post" class="form-grid compact">
+                                <input type="hidden" name="action" value="set_wallpaper" />
+                                <label>
+                                    Fondo login
+                                    <select name="wallpaper">
+                                        <option value="">Sin imagen</option>
+                                        <?php foreach ($wallpapers as $wall): ?>
+                                            <option value="<?= h($wall) ?>" <?= $selectedWallpaper === $wall ? 'selected' : '' ?>><?= h(basename($wall)) ?></option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </label>
+                                <button type="submit" class="btn small">Aplicar</button>
+                            </form>
+                        </div>
+                    </details>
 
                     <?php if ($user['role'] === ROLE_ADMIN): ?>
-                    <h3>Crear usuario</h3>
-                    <form method="post" class="form-grid two">
-                        <input type="hidden" name="action" value="add_user" />
-                        <label>Usuario<input type="text" name="username" required></label>
-                        <label>Contraseña<input type="password" name="password" required></label>
-                        <label>Nombre<input type="text" name="first_name"></label>
-                        <label>Apellido<input type="text" name="last_name"></label>
-                        <label>Rol
-                            <select name="role">
-                                <option value="<?= ROLE_OPERATOR ?>">Operador</option>
-                                <option value="<?= ROLE_ADMIN ?>">Admin</option>
-                            </select>
-                        </label>
-                        <div class="form-end"><button type="submit" class="btn primary small">Guardar usuario</button></div>
-                    </form>
+                        <details class="menu-subgroup">
+                            <summary>Usuarios</summary>
+                            <div class="menu-subcontent users-subcontent">
+                                <a class="menu-link" href="index.php?modal=create_user">Crear usuario</a>
+                                <div class="users-list">
+                                    <strong>Usuarios actuales</strong>
+                                    <?php if (!$usersList): ?>
+                                        <div class="muted">No hay usuarios.</div>
+                                    <?php else: ?>
+                                        <?php foreach ($usersList as $usr): ?>
+                                            <div class="user-row">
+                                                <span><?= h($usr['username']) ?></span>
+                                                <small><?= h($usr['role']) ?></small>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </details>
                     <?php endif; ?>
                 </div>
             </details>
@@ -613,7 +639,8 @@ $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '
                                 Tipo: <?= h($row['host_type'] ?: '-') ?><br>
                                 Ubicación: <?= h($row['location'] ?: '-') ?><br>
                                 Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                Segmento: <?= h($row['segment']) ?>
+                                Segmento: <?= h($row['segment']) ?><br>
+                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
                             </td>
                             <td>
                                 <?= h($row['last_status'] ?: 'SIN DATOS') ?>
@@ -668,6 +695,7 @@ $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '
                 <tr><th>Notas</th><td><?= h($detail['notes'] ?: '-') ?></td></tr>
                 <tr><th>Último estado</th><td><?= h($detail['last_status'] ?: '-') ?></td></tr>
                 <tr><th>Último ping</th><td><?= h($detail['last_ping_at'] ?: '-') ?></td></tr>
+                <tr><th>Registrado por</th><td><?= h($detail['created_by'] ?: '-') ?></td></tr>
             </table>
         </section>
 
@@ -690,6 +718,29 @@ $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '
                 </tbody>
             </table>
         </section>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($showCreateUserModal): ?>
+        <div class="modal-backdrop">
+            <section class="card modal-card create-user-modal">
+                <h2>Crear usuario</h2>
+                <a class="btn small ghost" href="index.php">Cerrar</a>
+                <form method="post" class="form-grid two">
+                    <input type="hidden" name="action" value="add_user" />
+                    <label>Usuario<input type="text" name="username" required></label>
+                    <label>Contraseña<input type="password" name="password" required></label>
+                    <label>Nombre<input type="text" name="first_name"></label>
+                    <label>Apellido<input type="text" name="last_name"></label>
+                    <label>Rol
+                        <select name="role">
+                            <option value="<?= ROLE_OPERATOR ?>">Operador</option>
+                            <option value="<?= ROLE_ADMIN ?>">Admin</option>
+                        </select>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn primary small">Guardar usuario</button></div>
+                </form>
+            </section>
         </div>
     <?php endif; ?>
 </main>
