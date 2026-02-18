@@ -569,6 +569,7 @@ function resolve_auto_scan_prefix(): ?string
 
 function run_segment_scan(string $prefix, string $createdBy): array
 {
+    @ini_set('max_execution_time', '0');
     if (function_exists('set_time_limit')) {
         @set_time_limit(0);
     }
@@ -582,7 +583,7 @@ function run_segment_scan(string $prefix, string $createdBy): array
 
     for ($host = 1; $host <= 254; $host++) {
         if ($host % 25 === 0 && function_exists('set_time_limit')) {
-            @set_time_limit(15);
+            @set_time_limit(0);
         }
 
         $ip = $prefix . '.' . $host;
