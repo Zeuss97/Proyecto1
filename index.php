@@ -79,6 +79,7 @@ function init_db(): void
         last_ping_at TEXT,
         last_status TEXT,
         last_output TEXT,
+        last_uptime TEXT,
         created_at TEXT NOT NULL,
         created_by TEXT
     )');
@@ -87,6 +88,9 @@ function init_db(): void
     $columnNames = array_column($columns, 'name');
     if (!in_array('created_by', $columnNames, true)) {
         $pdo->exec('ALTER TABLE ip_registry ADD COLUMN created_by TEXT');
+    }
+    if (!in_array('last_uptime', $columnNames, true)) {
+        $pdo->exec('ALTER TABLE ip_registry ADD COLUMN last_uptime TEXT');
     }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ping_logs (
@@ -214,6 +218,35 @@ function parse_hostname_from_output(string $output): ?string
     return null;
 }
 
+function probe_uptime(string $ip): ?string
+{
+    $snmpPath = trim((string) @shell_exec('command -v snmpget 2>/dev/null'));
+    if ($snmpPath === '') {
+        return null;
+    }
+
+    $cmd = sprintf('%s -v2c -c public -t 1 -r 0 %s 1.3.6.1.2.1.1.3.0 2>/dev/null', escapeshellcmd($snmpPath), escapeshellarg($ip));
+    $raw = trim((string) @shell_exec($cmd));
+    if ($raw === '') {
+        return null;
+    }
+
+    if (preg_match('/\((\d+)\)/', $raw, $m)) {
+        $ticks = (int) $m[1];
+        $seconds = (int) floor($ticks / 100);
+        $days = intdiv($seconds, 86400);
+        $hours = intdiv($seconds % 86400, 3600);
+        $minutes = intdiv($seconds % 3600, 60);
+        $secs = $seconds % 60;
+        if ($days > 0) {
+            return sprintf('%dd %02d:%02d:%02d', $days, $hours, $minutes, $secs);
+        }
+        return sprintf('%02d:%02d:%02d', $hours, $minutes, $secs);
+    }
+
+    return null;
+}
+
 function ping_ip(string $ip): array
 {
     $isWindows = strtoupper(substr(PHP_OS_FAMILY, 0, 3)) === 'WIN';
@@ -242,16 +275,19 @@ function ping_ip(string $ip): array
 function run_ping_for_ip(string $ip): void
 {
     $result = ping_ip($ip);
+    $uptime = probe_uptime($ip);
     $timestamp = now_iso();
 
     $update = db()->prepare('UPDATE ip_registry
         SET last_ping_at = :last_ping_at, last_status = :last_status, last_output = :last_output,
+            last_uptime = COALESCE(:last_uptime, last_uptime),
             host_name = COALESCE(NULLIF(host_name, ""), :host_name)
         WHERE ip_address = :ip_address');
     $update->execute([
         'last_ping_at' => $timestamp,
         'last_status' => $result['status'],
         'last_output' => $result['output'],
+        'last_uptime' => $uptime,
         'host_name' => $result['hostname'],
         'ip_address' => $ip,
     ]);
@@ -873,12 +909,12 @@ if (!in_array($view, ['dashboard', 'ips'], true)) {
                                 <td>
                                     Alias: <?= h($row['alias'] ?: '-') ?><br>
                                     Nombre: <?= h($row['host_name'] ?: '-') ?><br>
-                                    Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                    Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                    Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                    Segmento: <?= h($row['segment']) ?><br>
-                                    Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                                </td>
+                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
+                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
+                                Notas: <?= h($row['notes'] ?: '-') ?><br>
+                                Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
+                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
+                            </td>
                                 <td>
                                     <?= h($row['last_status'] ?: 'SIN DATOS') ?>
                                     <div class="muted"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
@@ -932,6 +968,7 @@ if (!in_array($view, ['dashboard', 'ips'], true)) {
                     <tr><th>Notas</th><td><?= h($detail['notes'] ?: '-') ?></td></tr>
                     <tr><th>Último estado</th><td><?= h($detail['last_status'] ?: '-') ?></td></tr>
                     <tr><th>Último ping</th><td><?= h($detail['last_ping_at'] ? format_display_datetime($detail['last_ping_at']) : '-') ?></td></tr>
+                    <tr><th>Último uptime</th><td><?= h($detail['last_uptime'] ?: '-') ?></td></tr>
                     <tr><th>Registrado por</th><td><?= h($detail['created_by'] ?: '-') ?></td></tr>
                 </table>
             </section>
