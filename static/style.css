@@ -210,6 +210,28 @@ body:not(.login-page)::before {
 .card h2 { margin-top: 0; margin-bottom: 12px; }
 .card-title-row { display:flex; justify-content:space-between; align-items:center; gap:12px; }
 
+.view-nav { display:flex; gap:8px; align-items:center; }
+
+.dashboard-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.segment-card {
+    display: grid;
+    gap: 4px;
+    text-decoration: none;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+}
+
+.segment-card:hover { transform: translateY(-1px); }
+
 .collapsible-card > summary {
     list-style: none;
     cursor: pointer;

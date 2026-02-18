@@ -402,7 +402,7 @@ if ($action === 'add_ip') {
     } catch (PDOException) {
         flash('La IP ya existe.', 'error');
     }
-    redirect('index.php');
+    redirect('index.php?view=ips');
 }
 
 if ($action === 'save_ip') {
@@ -424,7 +424,7 @@ if ($action === 'save_ip') {
         'ip_address' => $ip,
     ]);
     flash('Datos actualizados.', 'success');
-    redirect('index.php');
+    redirect('index.php?view=ips');
 }
 
 if ($action === 'add_user') {
@@ -537,7 +537,7 @@ if ($action === 'ping_now') {
         run_ping_for_ip($ip);
         flash('Ping ejecutado para ' . $ip . '.', 'success');
     }
-    redirect('index.php');
+    redirect('index.php?view=ips');
 }
 
 if ($action === 'ping_all') {
@@ -546,7 +546,7 @@ if ($action === 'ping_all') {
         run_ping_for_ip($row['ip_address']);
     }
     flash('Ping manual ejecutado para todas las IPs.', 'success');
-    redirect('index.php');
+    redirect('index.php?view=ips');
 }
 
 $segmentFilterInput = trim((string) ($_GET['segment'] ?? ''));
@@ -629,6 +629,13 @@ foreach ($segmentStats as $seg) {
 }
 
 $dashboardUsedPct = min(100, max(0, (int) round(($dashboardData['used'] / 254) * 100)));
+$dashboardSegmentOctet = '';
+if ($dashboardData['segment'] !== '' && str_contains($dashboardData['segment'], '.')) {
+    $parts = explode('.', $dashboardData['segment']);
+    if (isset($parts[2])) {
+        $dashboardSegmentOctet = $parts[2];
+    }
+}
 
 $detailIp = trim((string) ($_GET['ip'] ?? ''));
 $detail = null;
@@ -660,6 +667,10 @@ $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
 $showEditUserModal = $user['role'] === ROLE_ADMIN && $modal === 'edit_user';
 $showResetPasswordModal = $user['role'] === ROLE_ADMIN && $modal === 'reset_password';
 $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
+$view = trim((string) ($_GET['view'] ?? 'dashboard'));
+if (!in_array($view, ['dashboard', 'ips'], true)) {
+    $view = 'dashboard';
+}
 ?>
 <!doctype html>
 <html lang="es" data-theme="<?= h($theme) ?>">
@@ -722,199 +733,230 @@ $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
         <div class="flash <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div>
     <?php endif; ?>
 
-    <?php if ($user['role'] === ROLE_ADMIN): ?>
-    <details class="card collapsible-card" open>
-        <summary><h2>Registrar IP</h2></summary>
-        <form method="post" class="form-grid three">
-            <input type="hidden" name="action" value="add_ip" />
-            <label>IP<input type="text" name="ip_address" required></label>
-            <label>Alias<input type="text" name="alias"></label>
-            <label>Ubicación<input type="text" name="location"></label>
-            <div class="form-end"><button type="submit" class="btn primary small">Registrar</button></div>
-        </form>
-    </details>
-    <?php endif; ?>
+    <nav class="view-nav card">
+        <a class="btn small <?= $view === 'dashboard' ? 'primary' : '' ?>" href="index.php?view=dashboard">Dashboard</a>
+        <a class="btn small <?= $view === 'ips' ? 'primary' : '' ?>" href="index.php?view=ips">Gestión de IPs</a>
+    </nav>
 
-    <details class="card collapsible-card" open>
-        <summary><h2>Buscar y filtrar</h2></summary>
-        <form method="get" class="form-grid four">
-            <label>Segmento (/24 o solo rango)
-                <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
-            </label>
-            <label>Número de IP
-                <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56">
-            </label>
-            <label>Nombre equipo
-                <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias">
-            </label>
-            <label>Ubicación
-                <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
-            </label>
-            <div class="form-end">
-                <button type="submit" class="btn small">Aplicar</button>
-                <a class="btn ghost small" href="index.php">Limpiar</a>
-            </div>
-        </form>
-    </details>
-
-    <details class="card collapsible-card" open>
-        <summary><h2>Dashboard por segmento</h2></summary>
-        <form method="get" class="form-grid three dashboard-controls">
-            <label>Segmento
-                <select name="dashboard_segment">
-                    <?php foreach ($segmentStats as $seg): ?>
-                        <option value="<?= h($seg['segment']) ?>" <?= $dashboardData['segment'] === $seg['segment'] ? 'selected' : '' ?>><?= h($seg['segment']) ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </label>
-            <input type="hidden" name="segment" value="<?= h($segmentFilterInput) ?>">
-            <input type="hidden" name="ip_filter" value="<?= h($ipFilterInput) ?>">
-            <input type="hidden" name="name_filter" value="<?= h($nameFilterInput) ?>">
-            <input type="hidden" name="location_filter" value="<?= h($locationFilterInput) ?>">
-            <div class="form-end"><button type="submit" class="btn small">Ver</button></div>
-        </form>
-        <?php if (!$segmentStats): ?>
-            <div class="muted">No hay datos para mostrar dashboard.</div>
-        <?php else: ?>
-            <div class="dashboard-grid">
-                <div class="chart-wrap">
-                    <div class="pie-chart" style="--used: <?= $dashboardUsedPct ?>;"></div>
-                    <div>
-                        <strong><?= h($dashboardData['segment']) ?></strong>
-                        <div class="muted">Usadas: <?= h((string) $dashboardData['used']) ?> · Libres: <?= h((string) $dashboardData['free']) ?></div>
-                    </div>
-                </div>
-                <div class="table-wrap">
-                    <table>
-                        <thead><tr><th>Segmento</th><th>IPs usadas</th><th>IPs libres</th></tr></thead>
-                        <tbody>
+    <?php if ($view === 'dashboard'): ?>
+        <section class="card">
+            <h2>Dashboard por segmento</h2>
+            <form method="get" class="form-grid three dashboard-controls">
+                <input type="hidden" name="view" value="dashboard">
+                <label>Segmento
+                    <select name="dashboard_segment">
                         <?php foreach ($segmentStats as $seg): ?>
-                            <tr>
-                                <td><?= h($seg['segment']) ?></td>
-                                <td><?= h((string) $seg['used']) ?></td>
-                                <td><?= h((string) $seg['free']) ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        <?php endif; ?>
-    </details>
-
-    <section class="card">
-        <div class="card-title-row">
-            <h2>IPs registradas</h2>
-            <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
-        </div>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                <tr>
-                    <th>IP</th>
-                    <th>Ubicación</th>
-                    <th>Detalles</th>
-                    <th>Estado</th>
-                    <th>Acciones</th>
-                </tr>
-                </thead>
-                <tbody>
-                <?php if (!$rows): ?>
-                    <tr><td colspan="5">No hay IPs registradas.</td></tr>
-                <?php else: ?>
-                    <?php foreach ($rows as $row): ?>
-                        <tr>
-                            <td>
-                                <strong><?= h($row['ip_address']) ?></strong>
-                                <div class="muted"><?= h($row['host_name'] ?: '-') ?></div>
-                            </td>
-                            <td><?= h($row['location'] ?: '-') ?></td>
-                            <td>
-                                Alias: <?= h($row['alias'] ?: '-') ?><br>
-                                Nombre: <?= h($row['host_name'] ?: '-') ?><br>
-                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                Segmento: <?= h($row['segment']) ?><br>
-                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                            </td>
-                            <td>
-                                <?= h($row['last_status'] ?: 'SIN DATOS') ?>
-                                <div class="muted"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
-                            </td>
-                            <td class="actions-col">
-                                <a class="btn small" href="index.php?action=detail&amp;ip=<?= urlencode($row['ip_address']) ?>">Detalles</a>
-                                <form method="post">
-                                    <input type="hidden" name="action" value="ping_now">
-                                    <input type="hidden" name="ip_address" value="<?= h($row['ip_address']) ?>">
-                                    <button class="btn small">Ping</button>
-                                </form>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-    </section>
-
-    <?php if ($detail): ?>
-        <div class="modal-backdrop">
-        <section class="card modal-card">
-            <h2>Detalle de IP - <?= h($detail['ip_address']) ?></h2>
-            <a class="btn small ghost" href="index.php">Cerrar</a>
-            <form method="post" class="form-grid two">
-                <input type="hidden" name="action" value="save_ip" />
-                <input type="hidden" name="ip_address" value="<?= h($detail['ip_address']) ?>" />
-                <label>Alias<input type="text" name="alias" value="<?= h($detail['alias']) ?>"></label>
-                <label>Nombre<input type="text" name="host_name" value="<?= h($detail['host_name']) ?>"></label>
-                <label>Tipo
-                    <select name="host_type">
-                        <option value="">-</option>
-                        <?php foreach (HOST_TYPES as $type): ?>
-                            <option value="<?= h($type) ?>" <?= ($detail['host_type'] === $type) ? 'selected' : '' ?>><?= h($type) ?></option>
+                            <option value="<?= h($seg['segment']) ?>" <?= $dashboardData['segment'] === $seg['segment'] ? 'selected' : '' ?>><?= h($seg['segment']) ?></option>
                         <?php endforeach; ?>
                     </select>
                 </label>
-                <label>Ubicación<input type="text" name="location" value="<?= h($detail['location']) ?>"></label>
-                <label class="full">Notas<textarea name="notes" rows="3"><?= h($detail['notes']) ?></textarea></label>
-                <div class="form-end full"><button class="btn primary small" type="submit">Guardar cambios</button></div>
+                <div class="form-end"><button type="submit" class="btn small">Ver</button></div>
+                <div class="form-end">
+                    <?php if ($dashboardSegmentOctet !== ''): ?>
+                        <a class="btn small" href="index.php?view=ips&amp;segment=<?= urlencode($dashboardSegmentOctet) ?>">Ver IPs de este segmento</a>
+                    <?php else: ?>
+                        <span class="btn small" aria-disabled="true">Ver IPs de este segmento</span>
+                    <?php endif; ?>
+                </div>
             </form>
 
-            <h3>Resumen</h3>
-            <table>
-                <tr><th>IP</th><td><?= h($detail['ip_address']) ?></td></tr>
-                <tr><th>Hostname</th><td><?= h($detail['host_name'] ?: '-') ?></td></tr>
-                <tr><th>Alias</th><td><?= h($detail['alias'] ?: '-') ?></td></tr>
-                <tr><th>Tipo</th><td><?= h($detail['host_type'] ?: '-') ?></td></tr>
-                <tr><th>Ubicación</th><td><?= h($detail['location'] ?: '-') ?></td></tr>
-                <tr><th>Notas</th><td><?= h($detail['notes'] ?: '-') ?></td></tr>
-                <tr><th>Último estado</th><td><?= h($detail['last_status'] ?: '-') ?></td></tr>
-                <tr><th>Último ping</th><td><?= h($detail['last_ping_at'] ? format_display_datetime($detail['last_ping_at']) : '-') ?></td></tr>
-                <tr><th>Registrado por</th><td><?= h($detail['created_by'] ?: '-') ?></td></tr>
-            </table>
+            <?php if (!$segmentStats): ?>
+                <div class="muted">No hay datos para mostrar dashboard.</div>
+            <?php else: ?>
+                <div class="dashboard-cards">
+                    <?php foreach ($segmentStats as $seg): ?>
+                        <?php $usedPct = min(100, max(0, (int) round(($seg['used'] / 254) * 100))); ?>
+                        <a class="segment-card" href="index.php?view=dashboard&amp;dashboard_segment=<?= urlencode($seg['segment']) ?>">
+                            <strong><?= h($seg['segment']) ?></strong>
+                            <div>Usadas: <?= h((string) $seg['used']) ?></div>
+                            <div>Libres: <?= h((string) $seg['free']) ?></div>
+                            <div class="muted">Disponibilidad: <?= h((string) (100 - $usedPct)) ?>%</div>
+                        </a>
+                    <?php endforeach; ?>
+                </div>
+
+                <div class="dashboard-grid">
+                    <div class="chart-wrap">
+                        <div class="pie-chart" style="--used: <?= $dashboardUsedPct ?>;"></div>
+                        <div>
+                            <strong><?= h($dashboardData['segment']) ?></strong>
+                            <div class="muted">Usadas: <?= h((string) $dashboardData['used']) ?> · Libres: <?= h((string) $dashboardData['free']) ?></div>
+                            <div class="muted">Capacidad total por segmento: 254 IPs</div>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Segmento</th><th>IPs usadas</th><th>IPs libres</th><th>Disponibilidad</th></tr></thead>
+                            <tbody>
+                            <?php foreach ($segmentStats as $seg): ?>
+                                <?php $usedPct = min(100, max(0, (int) round(($seg['used'] / 254) * 100))); ?>
+                                <tr>
+                                    <td><?= h($seg['segment']) ?></td>
+                                    <td><?= h((string) $seg['used']) ?></td>
+                                    <td><?= h((string) $seg['free']) ?></td>
+                                    <td><?= h((string) (100 - $usedPct)) ?>%</td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </section>
+    <?php endif; ?>
+
+    <?php if ($view === 'ips'): ?>
+        <?php if ($user['role'] === ROLE_ADMIN): ?>
+        <details class="card collapsible-card" open>
+            <summary><h2>Registrar IP</h2></summary>
+            <form method="post" class="form-grid three">
+                <input type="hidden" name="action" value="add_ip" />
+                <input type="hidden" name="view" value="ips" />
+                <label>IP<input type="text" name="ip_address" required></label>
+                <label>Alias<input type="text" name="alias"></label>
+                <label>Ubicación<input type="text" name="location"></label>
+                <div class="form-end"><button type="submit" class="btn primary small">Registrar</button></div>
+            </form>
+        </details>
+        <?php endif; ?>
+
+        <details class="card collapsible-card" open>
+            <summary><h2>Buscar y filtrar</h2></summary>
+            <form method="get" class="form-grid four">
+                <input type="hidden" name="view" value="ips" />
+                <label>Segmento (/24 o solo rango)
+                    <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
+                </label>
+                <label>Número de IP
+                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56">
+                </label>
+                <label>Nombre equipo
+                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias">
+                </label>
+                <label>Ubicación
+                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
+                </label>
+                <div class="form-end">
+                    <button type="submit" class="btn small">Aplicar</button>
+                    <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
+                </div>
+            </form>
+        </details>
+
+        <section class="card">
+            <div class="card-title-row">
+                <h2>IPs registradas</h2>
+                <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                    <tr>
+                        <th>IP</th>
+                        <th>Ubicación</th>
+                        <th>Detalles</th>
+                        <th>Estado</th>
+                        <th>Acciones</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <?php if (!$rows): ?>
+                        <tr><td colspan="5">No hay IPs registradas.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($rows as $row): ?>
+                            <tr>
+                                <td>
+                                    <strong><?= h($row['ip_address']) ?></strong>
+                                    <div class="muted"><?= h($row['host_name'] ?: '-') ?></div>
+                                </td>
+                                <td><?= h($row['location'] ?: '-') ?></td>
+                                <td>
+                                    Alias: <?= h($row['alias'] ?: '-') ?><br>
+                                    Nombre: <?= h($row['host_name'] ?: '-') ?><br>
+                                    Tipo: <?= h($row['host_type'] ?: '-') ?><br>
+                                    Ubicación: <?= h($row['location'] ?: '-') ?><br>
+                                    Notas: <?= h($row['notes'] ?: '-') ?><br>
+                                    Segmento: <?= h($row['segment']) ?><br>
+                                    Registrado por: <?= h($row['created_by'] ?: '-') ?>
+                                </td>
+                                <td>
+                                    <?= h($row['last_status'] ?: 'SIN DATOS') ?>
+                                    <div class="muted"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
+                                </td>
+                                <td class="actions-col">
+                                    <a class="btn small" href="index.php?view=ips&amp;action=detail&amp;ip=<?= urlencode($row['ip_address']) ?>">Detalles</a>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="ping_now">
+                                        <input type="hidden" name="ip_address" value="<?= h($row['ip_address']) ?>">
+                                        <button class="btn small">Ping</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
         </section>
 
-        <section class="card modal-card">
-            <h2>Historial de ping (últimos 7 días)</h2>
-            <table>
-                <thead><tr><th>Fecha</th><th>Estado</th><th>Hostname</th></tr></thead>
-                <tbody>
-                <?php if (!$history): ?>
-                    <tr><td colspan="3">No hay registros aún.</td></tr>
-                <?php else: ?>
-                    <?php foreach ($history as $log): ?>
-                        <tr>
-                            <td><?= h(format_display_datetime($log['pinged_at'])) ?></td>
-                            <td><?= h($log['status']) ?></td>
-                            <td><?= h($log['hostname']) ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-                </tbody>
-            </table>
-        </section>
-        </div>
+        <?php if ($detail): ?>
+            <div class="modal-backdrop">
+            <section class="card modal-card">
+                <h2>Detalle de IP - <?= h($detail['ip_address']) ?></h2>
+                <a class="btn small ghost" href="index.php?view=ips">Cerrar</a>
+                <form method="post" class="form-grid two">
+                    <input type="hidden" name="action" value="save_ip" />
+                    <input type="hidden" name="ip_address" value="<?= h($detail['ip_address']) ?>" />
+                    <label>Alias<input type="text" name="alias" value="<?= h($detail['alias']) ?>"></label>
+                    <label>Nombre<input type="text" name="host_name" value="<?= h($detail['host_name']) ?>"></label>
+                    <label>Tipo
+                        <select name="host_type">
+                            <option value="">-</option>
+                            <?php foreach (HOST_TYPES as $type): ?>
+                                <option value="<?= h($type) ?>" <?= ($detail['host_type'] === $type) ? 'selected' : '' ?>><?= h($type) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+                    <label>Ubicación<input type="text" name="location" value="<?= h($detail['location']) ?>"></label>
+                    <label class="full">Notas<textarea name="notes" rows="3"><?= h($detail['notes']) ?></textarea></label>
+                    <div class="form-end full"><button class="btn primary small" type="submit">Guardar cambios</button></div>
+                </form>
+
+                <h3>Resumen</h3>
+                <table>
+                    <tr><th>IP</th><td><?= h($detail['ip_address']) ?></td></tr>
+                    <tr><th>Hostname</th><td><?= h($detail['host_name'] ?: '-') ?></td></tr>
+                    <tr><th>Alias</th><td><?= h($detail['alias'] ?: '-') ?></td></tr>
+                    <tr><th>Tipo</th><td><?= h($detail['host_type'] ?: '-') ?></td></tr>
+                    <tr><th>Ubicación</th><td><?= h($detail['location'] ?: '-') ?></td></tr>
+                    <tr><th>Notas</th><td><?= h($detail['notes'] ?: '-') ?></td></tr>
+                    <tr><th>Último estado</th><td><?= h($detail['last_status'] ?: '-') ?></td></tr>
+                    <tr><th>Último ping</th><td><?= h($detail['last_ping_at'] ? format_display_datetime($detail['last_ping_at']) : '-') ?></td></tr>
+                    <tr><th>Registrado por</th><td><?= h($detail['created_by'] ?: '-') ?></td></tr>
+                </table>
+            </section>
+
+            <section class="card modal-card">
+                <h2>Historial de ping (últimos 7 días)</h2>
+                <table>
+                    <thead><tr><th>Fecha</th><th>Estado</th><th>Hostname</th></tr></thead>
+                    <tbody>
+                    <?php if (!$history): ?>
+                        <tr><td colspan="3">No hay registros aún.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($history as $log): ?>
+                            <tr>
+                                <td><?= h(format_display_datetime($log['pinged_at'])) ?></td>
+                                <td><?= h($log['status']) ?></td>
+                                <td><?= h($log['hostname']) ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+            </section>
+            </div>
+        <?php endif; ?>
     <?php endif; ?>
 
     <?php if ($showCreateUserModal): ?>
