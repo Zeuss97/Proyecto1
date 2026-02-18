@@ -417,6 +417,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
 {
     $timestamp = now_iso();
     $uptime = probe_uptime($ip);
+    $resolvedAlias = trim((string) ($result['hostname'] ?? ''));
     try {
         $insert = db()->prepare('INSERT INTO ip_registry (
             ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
@@ -425,7 +426,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
         )');
         $insert->execute([
             'ip_address' => $ip,
-            'alias' => '',
+            'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'location' => '',
             'last_ping_at' => $timestamp,
@@ -446,6 +447,11 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             last_status = :last_status,
             last_output = :last_output,
             last_uptime = COALESCE(:last_uptime, last_uptime),
+            alias = CASE
+                WHEN alias IS NULL OR TRIM(alias) = "" OR UPPER(TRIM(alias)) = "LIBRE"
+                    THEN COALESCE(NULLIF(:alias, ""), alias)
+                ELSE alias
+            END,
             host_name = COALESCE(NULLIF(host_name, ""), :host_name)
             WHERE ip_address = :ip_address');
         $update->execute([
@@ -455,10 +461,44 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             'last_status' => $result['status'],
             'last_output' => $result['output'],
             'last_uptime' => $uptime,
+            'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'ip_address' => $ip,
         ]);
         return 'updated';
+    }
+}
+
+function count_ips_in_prefix(string $prefix): int
+{
+    $stmt = db()->prepare('SELECT COUNT(*) FROM ip_registry WHERE ip_address LIKE :prefix_like');
+    $stmt->execute(['prefix_like' => $prefix . '.%']);
+    return (int) $stmt->fetchColumn();
+}
+
+function insert_free_placeholder_ip(string $ip, string $createdBy): bool
+{
+    $timestamp = now_iso();
+    try {
+        $stmt = db()->prepare('INSERT INTO ip_registry (
+            ip_address, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
+        ) VALUES (
+            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_status, :last_output, :created_at, :created_by
+        )');
+        $stmt->execute([
+            'ip_address' => $ip,
+            'alias' => 'LIBRE',
+            'host_name' => '',
+            'location' => '',
+            'last_ping_at' => $timestamp,
+            'last_status' => 'ERROR',
+            'last_output' => 'No responde (placeholder primer escaneo)',
+            'created_at' => $timestamp,
+            'created_by' => $createdBy,
+        ]);
+        return true;
+    } catch (PDOException) {
+        return false;
     }
 }
 
@@ -518,11 +558,19 @@ function run_segment_scan(string $prefix, string $createdBy): array
     $foundOnline = 0;
     $inserted = 0;
     $updated = 0;
+    $markedFree = 0;
+    $existingInSegment = count_ips_in_prefix($prefix);
+    $seedOfflineAsFree = $existingInSegment === 0;
 
     for ($host = 1; $host <= 254; $host++) {
         $ip = $prefix . '.' . $host;
         $result = ping_ip($ip);
         if ($result['status'] !== 'OK') {
+            if ($seedOfflineAsFree) {
+                if (insert_free_placeholder_ip($ip, $createdBy)) {
+                    $markedFree++;
+                }
+            }
             continue;
         }
 
@@ -539,6 +587,8 @@ function run_segment_scan(string $prefix, string $createdBy): array
         'found_online' => $foundOnline,
         'inserted' => $inserted,
         'updated' => $updated,
+        'marked_free' => $markedFree,
+        'seeded_full_segment' => $seedOfflineAsFree,
     ];
 }
 
@@ -754,7 +804,11 @@ if ($action === 'scan_segment') {
 
     $scanStats = run_segment_scan($prefix, $user['username']);
 
-    flash(sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $scanStats['found_online'], $scanStats['inserted'], $scanStats['updated']), 'success');
+    $message = sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $scanStats['found_online'], $scanStats['inserted'], $scanStats['updated']);
+    if ($scanStats['seeded_full_segment']) {
+        $message .= sprintf(' Marcadas como LIBRE (sin respuesta): %d.', $scanStats['marked_free']);
+    }
+    flash($message, 'success');
     $segmentOctet = explode('.', $prefix)[2] ?? '';
     redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
