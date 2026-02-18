@@ -179,6 +179,18 @@ function redirect(string $url): never
     exit;
 }
 
+function safe_redirect_target(?string $target, string $default = 'index.php'): string
+{
+    $raw = trim((string) $target);
+    if ($raw === '' || str_starts_with($raw, 'http://') || str_starts_with($raw, 'https://') || str_starts_with($raw, '//')) {
+        return $default;
+    }
+    if (!str_starts_with($raw, 'index.php')) {
+        return $default;
+    }
+    return $raw;
+}
+
 function h(?string $value): string
 {
     return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
@@ -437,12 +449,13 @@ if ($action === 'set_wallpaper') {
 
 if ($action === 'toggle_theme') {
     $_SESSION['theme'] = (($_SESSION['theme'] ?? 'light') === 'light') ? 'dark' : 'light';
-    redirect('index.php');
+    $redirectTo = safe_redirect_target($_POST['redirect_to'] ?? null, 'index.php');
+    redirect($redirectTo);
 }
 
 if ($action === 'add_ip') {
-    if ($user['role'] !== ROLE_ADMIN) {
-        flash('Solo admin puede registrar IPs.', 'error');
+    if (!in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)) {
+        flash('No tienes permisos para registrar IPs.', 'error');
         redirect('index.php');
     }
 
@@ -738,6 +751,7 @@ $view = trim((string) ($_GET['view'] ?? 'dashboard'));
 if (!in_array($view, ['dashboard', 'ips'], true)) {
     $view = 'dashboard';
 }
+$currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 ?>
 <!doctype html>
 <html lang="es" data-theme="<?= h($theme) ?>">
@@ -756,30 +770,34 @@ if (!in_array($view, ['dashboard', 'ips'], true)) {
         </div>
         <div class="top-actions">
             <span class="pill">Perfil (<?= h($displayName) ?>)</span>
-            <form method="post"><input type="hidden" name="action" value="toggle_theme"><button class="btn">Modo <?= $theme === 'light' ? 'nocturno' : 'claro' ?></button></form>
-            <details class="settings-menu">
-                <summary class="btn">Mantenimiento</summary>
-                <div class="settings-panel menu-panel">
-                    <div class="menu-item">
-                        <div class="menu-item-title">Personalización</div>
-                        <div class="menu-subcontent">
-                            <form method="post" class="form-grid compact">
-                                <input type="hidden" name="action" value="set_wallpaper" />
-                                <label>
-                                    Fondo login
-                                    <select name="wallpaper">
-                                        <option value="">Sin imagen</option>
-                                        <?php foreach ($wallpapers as $wall): ?>
-                                            <option value="<?= h($wall) ?>" <?= $selectedWallpaper === $wall ? 'selected' : '' ?>><?= h(basename($wall)) ?></option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                </label>
-                                <button type="submit" class="btn small">Aplicar</button>
-                            </form>
+            <form method="post">
+                <input type="hidden" name="action" value="toggle_theme">
+                <input type="hidden" name="redirect_to" value="<?= h($currentUrl) ?>">
+                <button class="btn">Modo <?= $theme === 'light' ? 'nocturno' : 'claro' ?></button>
+            </form>
+            <?php if ($user['role'] === ROLE_ADMIN): ?>
+                <details class="settings-menu">
+                    <summary class="btn">Mantenimiento</summary>
+                    <div class="settings-panel menu-panel">
+                        <div class="menu-item">
+                            <div class="menu-item-title">Personalización</div>
+                            <div class="menu-subcontent">
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="set_wallpaper" />
+                                    <label>
+                                        Fondo login
+                                        <select name="wallpaper">
+                                            <option value="">Sin imagen</option>
+                                            <?php foreach ($wallpapers as $wall): ?>
+                                                <option value="<?= h($wall) ?>" <?= $selectedWallpaper === $wall ? 'selected' : '' ?>><?= h(basename($wall)) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </label>
+                                    <button type="submit" class="btn small">Aplicar</button>
+                                </form>
+                            </div>
                         </div>
-                    </div>
 
-                    <?php if ($user['role'] === ROLE_ADMIN): ?>
                         <details class="menu-item flyout-parent">
                             <summary class="menu-item-title">Usuario</summary>
                             <div class="flyout-menu">
@@ -789,9 +807,9 @@ if (!in_array($view, ['dashboard', 'ips'], true)) {
                                 <a class="menu-link menu-link-block" href="index.php?modal=list_users">Listar usuarios</a>
                             </div>
                         </details>
-                    <?php endif; ?>
-                </div>
-            </details>
+                    </div>
+                </details>
+            <?php endif; ?>
             <form method="post"><input type="hidden" name="action" value="logout"><button class="btn primary">Cerrar sesión</button></form>
         </div>
     </header>
@@ -873,7 +891,7 @@ if (!in_array($view, ['dashboard', 'ips'], true)) {
     <?php endif; ?>
 
     <?php if ($view === 'ips'): ?>
-        <?php if ($user['role'] === ROLE_ADMIN): ?>
+        <?php if (in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)): ?>
         <details class="card collapsible-card" open>
             <summary><h2>Registrar IP</h2></summary>
             <form method="post" class="form-grid three">

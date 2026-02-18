@@ -46,6 +46,10 @@ body::before {
     z-index: -1;
 }
 
+.login-page::before {
+    opacity: 1;
+}
+
 body:not(.login-page)::before {
     background-image: none !important;
 }
@@ -363,7 +367,7 @@ th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: 
 .login-page { display:flex; justify-content:center; align-items:center; padding:20px; }
 .login-card {
     width:min(420px, 100%);
-    background: color-mix(in srgb, var(--surface) 80%, transparent);
+    background: color-mix(in srgb, var(--surface) 62%, transparent);
     border:1px solid var(--border);
     border-radius:14px;
     padding:20px;
