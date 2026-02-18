@@ -147,6 +147,13 @@ function normalize_segment_filter(string $input): ?string
         return null;
     }
 
+    if (preg_match('/^\d{1,3}$/', $raw)) {
+        $octet = (int) $raw;
+        if ($octet >= 0 && $octet <= 255) {
+            return 'THIRD_OCTET:' . $octet;
+        }
+    }
+
     if (preg_match('/^(\d{1,3})\/24$/', $raw, $m)) {
         $octet = (int) $m[1];
         if ($octet >= 0 && $octet <= 255) {
@@ -362,13 +369,15 @@ if ($action === 'add_ip') {
     }
 
     $alias = trim((string) ($_POST['alias'] ?? ''));
+    $location = trim((string) ($_POST['location'] ?? ''));
 
     try {
-        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, created_at, created_by)
-            VALUES (:ip_address, :alias, :created_at, :created_by)');
+        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, location, created_at, created_by)
+            VALUES (:ip_address, :alias, :location, :created_at, :created_by)');
         $stmt->execute([
             'ip_address' => $ip,
             'alias' => $alias,
+            'location' => $location,
             'created_at' => now_iso(),
             'created_by' => $user['username'],
         ]);
@@ -525,20 +534,43 @@ if ($action === 'ping_all') {
 
 $segmentFilterInput = trim((string) ($_GET['segment'] ?? ''));
 $segmentFilter = normalize_segment_filter($segmentFilterInput);
+$ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
+$nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
+$locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
 
 $sql = 'SELECT * FROM ip_registry';
 $params = [];
+$conditions = [];
 if ($segmentFilter !== null) {
     if (str_starts_with($segmentFilter, 'THIRD_OCTET:')) {
         $octet = (int) substr($segmentFilter, strlen('THIRD_OCTET:'));
-        $sql .= ' WHERE CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :octet';
+        $conditions[] = 'CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :octet';
         $params['octet'] = $octet;
     } else {
         [$a, $b, $c] = explode('.', explode('.0/24', $segmentFilter)[0]);
         $prefix = sprintf('%s.%s.%s.', $a, $b, $c);
-        $sql .= ' WHERE ip_address LIKE :prefix';
+        $conditions[] = 'ip_address LIKE :prefix';
         $params['prefix'] = $prefix . '%';
     }
+}
+
+if ($ipFilterInput !== '') {
+    $conditions[] = 'ip_address LIKE :ip_filter';
+    $params['ip_filter'] = '%' . $ipFilterInput . '%';
+}
+
+if ($nameFilterInput !== '') {
+    $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
+    $params['name_filter'] = '%' . $nameFilterInput . '%';
+}
+
+if ($locationFilterInput !== '') {
+    $conditions[] = 'location LIKE :location_filter';
+    $params['location_filter'] = '%' . $locationFilterInput . '%';
+}
+
+if ($conditions) {
+    $sql .= ' WHERE ' . implode(' AND ', $conditions);
 }
 $sql .= ' ORDER BY ip_address';
 $stmt = db()->prepare($sql);
@@ -649,15 +681,27 @@ $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
             <input type="hidden" name="action" value="add_ip" />
             <label>IP<input type="text" name="ip_address" required></label>
             <label>Alias<input type="text" name="alias"></label>
+            <label>Ubicación<input type="text" name="location"></label>
             <div class="form-end"><button type="submit" class="btn primary small">Registrar</button></div>
         </form>
     </section>
     <?php endif; ?>
 
     <section class="card">
-        <h2>Filtrar por segmento</h2>
-        <form method="get" class="form-grid three">
-            <label>CIDR<input type="text" name="segment" value="<?= h($segmentFilterInput) ?>"></label>
+        <h2>Buscar y filtrar</h2>
+        <form method="get" class="form-grid four">
+            <label>Segmento (/24 o solo rango)
+                <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
+            </label>
+            <label>Número de IP
+                <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56">
+            </label>
+            <label>Nombre equipo
+                <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias">
+            </label>
+            <label>Ubicación
+                <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
+            </label>
             <div class="form-end">
                 <button type="submit" class="btn small">Aplicar</button>
                 <a class="btn ghost small" href="index.php">Limpiar</a>

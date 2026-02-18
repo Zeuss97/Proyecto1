@@ -214,6 +214,7 @@ body:not(.login-page)::before {
 .form-grid.single { grid-template-columns: 1fr; }
 .form-grid.two { grid-template-columns: repeat(2, minmax(0,1fr)); }
 .form-grid.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.form-grid.four { grid-template-columns: repeat(4, minmax(0,1fr)); }
 .form-grid.compact { grid-template-columns: 2fr auto; align-items:end; }
 .full { grid-column: 1 / -1; }
 .form-end { display:flex; align-items:end; gap:8px; }
@@ -294,7 +295,7 @@ th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: 
 }
 
 @media (max-width: 920px) {
-    .form-grid.two, .form-grid.three, .form-grid.compact { grid-template-columns: 1fr; }
+    .form-grid.two, .form-grid.three, .form-grid.four, .form-grid.compact { grid-template-columns: 1fr; }
     .topbar { flex-direction:column; }
     .flyout-menu {
         position: static;
