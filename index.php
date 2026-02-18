@@ -2,7 +2,8 @@
 
 declare(strict_types=1);
 
-const DB_PATH = __DIR__ . '/ips.db';
+const DB_DIR = __DIR__ . '/data';
+const DB_PATH = DB_DIR . '/ips.db';
 const ROLE_ADMIN = 'admin';
 const ROLE_OPERATOR = 'operator';
 const HOST_TYPES = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
@@ -11,6 +12,13 @@ session_start();
 
 date_default_timezone_set('UTC');
 
+function ensure_db_directory(): void
+{
+    if (!is_dir(DB_DIR)) {
+        mkdir(DB_DIR, 0775, true);
+    }
+}
+
 function db(): PDO
 {
     static $pdo = null;
@@ -18,6 +26,7 @@ function db(): PDO
         return $pdo;
     }
 
+    ensure_db_directory();
     $pdo = new PDO('sqlite:' . DB_PATH);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);

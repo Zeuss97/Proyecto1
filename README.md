@@ -21,7 +21,8 @@ Aplicación migrada a **PHP puro** pensada para correr localmente con **XAMPP en
 - `index.php` → backend + renderizado principal.
 - `static/style.css` → estilos (light/dark).
 - `wallpaper/` → coloca aquí tus imágenes (`.jpg`, `.png`, `.webp`, etc.).
-- `ips.db` → base de datos SQLite (se crea sola).
+- `data/ips.db` → base de datos SQLite (se crea sola).
+- `data/` → carpeta autocreada al iniciar si no existe.
 
 ## Ejecutar con XAMPP (Windows)
 
@@ -45,3 +46,9 @@ Coloca archivos en:
 - `wallpaper/`
 
 Luego en la app, en **Personalizar fondo**, selecciona el archivo y aplica.
+
+
+## ¿Dónde se guardan los datos?
+
+- Se guardan en `data/ips.db` (SQLite).
+- Sí, la carpeta `data/` se **autocrea** en el arranque de la app.
