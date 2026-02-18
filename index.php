@@ -8,6 +8,9 @@ const ROLE_ADMIN = 'admin';
 const ROLE_OPERATOR = 'operator';
 const HOST_TYPES = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
 const DISPLAY_TZ = '-03:00';
+const AUTO_SCAN_TARGET_HOUR = 13;
+const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
+const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
 
 session_start();
 
@@ -475,6 +478,121 @@ function run_due_auto_pings(int $limit = 1): void
     }
 }
 
+function resolve_auto_scan_prefix(): ?string
+{
+    $configured = trim(get_app_setting(AUTO_SCAN_SEGMENT_KEY, ''));
+    if ($configured !== '') {
+        return resolve_scan_segment_prefix($configured);
+    }
+
+    $rows = db()->query('SELECT ip_address FROM ip_registry')->fetchAll();
+    $segments = [];
+    foreach ($rows as $row) {
+        $ip = (string) ($row['ip_address'] ?? '');
+        if (!validate_ip($ip) || filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+            continue;
+        }
+
+        $parts = explode('.', $ip);
+        if (count($parts) !== 4) {
+            continue;
+        }
+
+        $prefix = $parts[0] . '.' . $parts[1] . '.' . $parts[2];
+        if (!isset($segments[$prefix])) {
+            $segments[$prefix] = 0;
+        }
+        $segments[$prefix]++;
+    }
+
+    if ($segments === []) {
+        return null;
+    }
+
+    arsort($segments);
+    return (string) array_key_first($segments);
+}
+
+function run_segment_scan(string $prefix, string $createdBy): array
+{
+    $foundOnline = 0;
+    $inserted = 0;
+    $updated = 0;
+
+    for ($host = 1; $host <= 254; $host++) {
+        $ip = $prefix . '.' . $host;
+        $result = ping_ip($ip);
+        if ($result['status'] !== 'OK') {
+            continue;
+        }
+
+        $foundOnline++;
+        $state = upsert_scanned_ip($ip, $result, $createdBy);
+        if ($state === 'inserted') {
+            $inserted++;
+            continue;
+        }
+        $updated++;
+    }
+
+    return [
+        'found_online' => $foundOnline,
+        'inserted' => $inserted,
+        'updated' => $updated,
+    ];
+}
+
+function run_daily_auto_scan_if_due(): void
+{
+    $tz = new DateTimeZone(DISPLAY_TZ);
+    $nowLocal = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->setTimezone($tz);
+    if ((int) $nowLocal->format('G') < AUTO_SCAN_TARGET_HOUR) {
+        return;
+    }
+
+    $lastRunRaw = trim(get_app_setting(AUTO_SCAN_LAST_RUN_KEY, ''));
+    if ($lastRunRaw !== '') {
+        try {
+            $lastRunLocal = (new DateTimeImmutable($lastRunRaw))->setTimezone($tz);
+            if ($lastRunLocal->format('Y-m-d') === $nowLocal->format('Y-m-d')) {
+                return;
+            }
+        } catch (Exception) {
+            // Si el valor guardado está corrupto, se re-ejecuta y se corrige abajo.
+        }
+    }
+
+    $prefix = resolve_auto_scan_prefix();
+    if ($prefix === null) {
+        return;
+    }
+
+    run_segment_scan($prefix, 'system-auto-scan');
+    set_app_setting(AUTO_SCAN_LAST_RUN_KEY, now_iso());
+}
+
+function run_background_maintenance(int $pingLimit = 1): void
+{
+    $lockPath = DB_DIR . '/maintenance.lock';
+    $handle = fopen($lockPath, 'c+');
+    if ($handle === false) {
+        return;
+    }
+
+    if (!flock($handle, LOCK_EX | LOCK_NB)) {
+        fclose($handle);
+        return;
+    }
+
+    try {
+        run_due_auto_pings($pingLimit);
+        run_daily_auto_scan_if_due();
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+}
+
 function list_wallpapers(): array
 {
     $dir = __DIR__ . '/wallpaper';
@@ -489,6 +607,17 @@ function list_wallpapers(): array
 }
 
 init_db();
+
+if (PHP_SAPI === 'cli') {
+    $cliCommand = $argv[1] ?? '';
+    if ($cliCommand === 'worker') {
+        run_background_maintenance(10);
+        echo "OK\n";
+        exit(0);
+    }
+}
+
+run_background_maintenance();
 
 $action = $_POST['action'] ?? $_GET['action'] ?? null;
 $user = current_user();
@@ -623,64 +752,9 @@ if ($action === 'scan_segment') {
         redirect('index.php?view=ips');
     }
 
-    $foundOnline = 0;
-    $inserted = 0;
-    $updated = 0;
+    $scanStats = run_segment_scan($prefix, $user['username']);
 
-    for ($host = 1; $host <= 254; $host++) {
-        $ip = $prefix . '.' . $host;
-        $result = ping_ip($ip);
-        if ($result['status'] !== 'OK') {
-            continue;
-        }
-
-        $foundOnline++;
-        $timestamp = now_iso();
-        $uptime = probe_uptime($ip);
-
-        try {
-            $insert = db()->prepare('INSERT INTO ip_registry (
-                ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, last_status, last_output, last_uptime, created_at, created_by
-            ) VALUES (
-                :ip_address, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
-            )');
-            $insert->execute([
-                'ip_address' => $ip,
-                'alias' => '',
-                'host_name' => $result['hostname'] ?? '',
-                'location' => '',
-                'last_ping_at' => $timestamp,
-                'last_seen_online_at' => $timestamp,
-                'last_status' => $result['status'],
-                'last_output' => $result['output'],
-                'last_uptime' => $uptime,
-                'created_at' => $timestamp,
-                'created_by' => $user['username'],
-            ]);
-            $inserted++;
-        } catch (PDOException) {
-            $update = db()->prepare('UPDATE ip_registry SET
-                last_ping_at = :last_ping_at,
-                last_seen_online_at = :last_seen_online_at,
-                last_status = :last_status,
-                last_output = :last_output,
-                last_uptime = COALESCE(:last_uptime, last_uptime),
-                host_name = COALESCE(NULLIF(host_name, ""), :host_name)
-                WHERE ip_address = :ip_address');
-            $update->execute([
-                'last_ping_at' => $timestamp,
-                'last_seen_online_at' => $timestamp,
-                'last_status' => $result['status'],
-                'last_output' => $result['output'],
-                'last_uptime' => $uptime,
-                'host_name' => $result['hostname'] ?? '',
-                'ip_address' => $ip,
-            ]);
-            $updated++;
-        }
-    }
-
-    flash(sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $foundOnline, $inserted, $updated), 'success');
+    flash(sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $scanStats['found_online'], $scanStats['inserted'], $scanStats['updated']), 'success');
     $segmentOctet = explode('.', $prefix)[2] ?? '';
     redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
