@@ -304,11 +304,15 @@ if ($action === 'login') {
 
     if ($row && $auth['valid']) {
         if ($auth['upgrade_hash']) {
-            $update = db()->prepare('UPDATE users SET password_hash = :password_hash WHERE username = :username');
-            $update->execute([
-                'password_hash' => password_hash($password, PASSWORD_DEFAULT),
-                'username' => $row['username'],
-            ]);
+            try {
+                $update = db()->prepare('UPDATE users SET password_hash = :password_hash WHERE username = :username');
+                $update->execute([
+                    'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                    'username' => $row['username'],
+                ]);
+            } catch (Throwable $e) {
+                error_log('Password hash upgrade skipped for user "' . $row['username'] . '": ' . $e->getMessage());
+            }
         }
 
         $_SESSION['username'] = $row['username'];
