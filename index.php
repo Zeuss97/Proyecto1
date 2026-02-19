@@ -136,6 +136,10 @@ function init_db(): void
         pinged_at TEXT NOT NULL
     )');
 
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_ip_address ON ip_registry(ip_address)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_alias_nocase_host ON ip_registry(alias COLLATE NOCASE, host_name)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_host_name ON ip_registry(host_name)');
+
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
     if (!$stmt->fetchColumn()) {
@@ -1163,8 +1167,13 @@ if ($view === 'ips') {
     }
 
     if ($nameFilterInput !== '') {
-        $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
-        $params['name_filter'] = '%' . $nameFilterInput . '%';
+        if (strcasecmp($nameFilterInput, 'libre') === 0) {
+            $conditions[] = 'alias = :name_free_alias COLLATE NOCASE AND (host_name IS NULL OR host_name = "")';
+            $params['name_free_alias'] = 'LIBRE';
+        } else {
+            $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
+            $params['name_filter'] = '%' . $nameFilterInput . '%';
+        }
     }
 
     if ($locationFilterInput !== '') {
@@ -1173,7 +1182,8 @@ if ($view === 'ips') {
     }
 
     if ($onlyFreeInput) {
-        $conditions[] = 'UPPER(TRIM(COALESCE(alias, ""))) = "LIBRE" AND TRIM(COALESCE(host_name, "")) = ""';
+        $conditions[] = 'alias = :free_alias COLLATE NOCASE AND (host_name IS NULL OR host_name = "")';
+        $params['free_alias'] = 'LIBRE';
         if ($freeSegmentFilter !== null) {
             if (str_starts_with($freeSegmentFilter, 'THIRD_OCTET:')) {
                 $freeOctet = (int) substr($freeSegmentFilter, strlen('THIRD_OCTET:'));
