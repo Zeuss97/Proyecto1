@@ -133,10 +133,6 @@ function init_db(): void
         pinged_at TEXT NOT NULL
     )');
 
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_ip_address ON ip_registry(ip_address)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_alias_nocase_host ON ip_registry(alias COLLATE NOCASE, host_name)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_host_name ON ip_registry(host_name)');
-
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
     if (!$stmt->fetchColumn()) {
@@ -309,51 +305,6 @@ function compute_segment(string $ip): string
     return '-';
 }
 
-function is_free_alias(?string $alias): bool
-{
-    return strtoupper(trim((string) $alias)) === 'LIBRE';
-}
-
-function is_effectively_free_ip(?string $alias, ?string $hostName): bool
-{
-    if (!is_free_alias($alias)) {
-        return false;
-    }
-
-    return trim((string) $hostName) === '';
-}
-
-function load_dashboard_segment_stats(): array
-{
-    $cached = cache_get(DASHBOARD_STATS_CACHE_KEY, null);
-    if (is_array($cached)) {
-        return $cached;
-    }
-
-    $allIpRows = db()->query('SELECT ip_address, alias, host_name FROM ip_registry ORDER BY ip_address')->fetchAll();
-    $segmentStatsMap = [];
-    foreach ($allIpRows as $ipRow) {
-        $segment = compute_segment($ipRow['ip_address']);
-        if (!isset($segmentStatsMap[$segment])) {
-            $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
-        }
-
-        if (!is_effectively_free_ip($ipRow['alias'] ?? null, $ipRow['host_name'] ?? null)) {
-            $segmentStatsMap[$segment]['used']++;
-        }
-    }
-
-    foreach ($segmentStatsMap as &$segmentData) {
-        $segmentData['free'] = max(0, 254 - $segmentData['used']);
-    }
-    unset($segmentData);
-
-    $segmentStats = array_values($segmentStatsMap);
-    usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
-    cache_set(DASHBOARD_STATS_CACHE_KEY, $segmentStats, DASHBOARD_STATS_CACHE_TTL_SECONDS);
-    return $segmentStats;
-}
-
 function parse_hostname_from_output(string $output): ?string
 {
     $lines = preg_split('/\R/', $output) ?: [];
@@ -401,19 +352,13 @@ function ping_ip(string $ip): array
 {
     $isWindows = strtoupper(substr(PHP_OS_FAMILY, 0, 3)) === 'WIN';
     if ($isWindows) {
-        $command = sprintf('ping -a -n 1 -w %d %s', max(100, $timeoutMs), escapeshellarg($ip));
+        $command = sprintf('ping -a -n 1 -w 1000 %s', escapeshellarg($ip));
     } else {
-        static $hasTimeoutBinary = null;
-        if ($hasTimeoutBinary === null) {
-            $hasTimeoutBinary = trim((string) @shell_exec('command -v timeout 2>/dev/null')) !== '';
-        }
-
-        if ($hasTimeoutBinary) {
-            $timeoutSeconds = max(0.2, $timeoutMs / 1000);
-            $command = sprintf('timeout %.2f ping -c 1 -W 1 %s', $timeoutSeconds, escapeshellarg($ip));
-        } else {
-            $command = sprintf('ping -c 1 -W 1 %s', escapeshellarg($ip));
-        }
+        $pingCmd = sprintf('ping -n -c 1 -W 1 -w 2 %s', escapeshellarg($ip));
+        $timeoutBin = trim((string) @shell_exec('command -v timeout 2>/dev/null'));
+        $command = $timeoutBin !== ''
+            ? sprintf('%s 2 %s', escapeshellcmd($timeoutBin), $pingCmd)
+            : $pingCmd;
     }
 
     $outputLines = [];
@@ -422,7 +367,7 @@ function ping_ip(string $ip): array
 
     $output = trim(implode(PHP_EOL, $outputLines));
     $hostname = parse_hostname_from_output($output);
-    if ($allowDnsFallback && $exitCode === 0 && $hostname === null) {
+    if ($hostname === null) {
         $resolved = @gethostbyaddr($ip);
         if ($resolved !== false && $resolved !== $ip) {
             $hostname = $resolved;
@@ -811,11 +756,6 @@ if ($action === 'set_wallpaper') {
     if ($choice === '' || in_array($choice, $allowed, true)) {
         set_app_setting('login_wallpaper', $choice);
     }
-
-    $current = get_app_setting('enable_web_maintenance', ENABLE_WEB_MAINTENANCE_DEFAULT ? '1' : '0') === '1';
-    $next = $current ? '0' : '1';
-    set_app_setting('enable_web_maintenance', $next);
-    flash('Auto-refresh de mantenimiento ' . ($next === '1' ? 'activado' : 'desactivado') . '.', 'success');
     redirect('index.php');
 }
 
@@ -1031,53 +971,6 @@ $segmentFilter = normalize_segment_filter($segmentFilterInput);
 $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
 $nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
 $locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
-$onlyFreeInput = (string) ($_GET['only_free'] ?? '') === '1';
-$freeSegmentInput = trim((string) ($_GET['free_segment'] ?? ''));
-$freeSegmentFilter = normalize_segment_filter($freeSegmentInput);
-$pageInput = max(1, (int) ($_GET['page'] ?? 1));
-$perPage = $onlyFreeInput ? 60 : 200;
-$totalRows = 0;
-$totalPages = 1;
-$currentPage = 1;
-$freeSegmentOptions = [];
-foreach (load_dashboard_segment_stats() as $seg) {
-    $segmentValue = (string) ($seg['segment'] ?? '');
-    if ($segmentValue !== '' && $segmentValue !== '-') {
-        $freeSegmentOptions[] = $segmentValue;
-    }
-}
-
-$rows = [];
-if ($view === 'ips') {
-    $baseSql = 'FROM ip_registry';
-    $params = [];
-    $conditions = [];
-    if ($segmentFilter !== null) {
-        if (str_starts_with($segmentFilter, 'THIRD_OCTET:')) {
-            $octet = (int) substr($segmentFilter, strlen('THIRD_OCTET:'));
-            $conditions[] = 'CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :octet';
-            $params['octet'] = $octet;
-        } else {
-            [$a, $b, $c] = explode('.', explode('.0/24', $segmentFilter)[0]);
-            $prefix = sprintf('%s.%s.%s.', $a, $b, $c);
-            $conditions[] = 'ip_address LIKE :prefix';
-            $params['prefix'] = $prefix . '%';
-        }
-    }
-
-    if ($ipFilterInput !== '') {
-        $conditions[] = 'ip_address LIKE :ip_filter';
-        $params['ip_filter'] = '%' . $ipFilterInput . '%';
-    }
-
-    if ($nameFilterInput !== '') {
-        if (strcasecmp($nameFilterInput, 'libre') === 0) {
-            $conditions[] = 'alias = :name_free_alias COLLATE NOCASE AND (host_name IS NULL OR host_name = "")';
-            $params['name_free_alias'] = 'LIBRE';
-        } else {
-            $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
-            $params['name_filter'] = '%' . $nameFilterInput . '%';
-        }
 
 $sql = 'SELECT * FROM ip_registry';
 $params = [];
@@ -1093,55 +986,6 @@ if ($segmentFilter !== null) {
         $conditions[] = 'ip_address LIKE :prefix';
         $params['prefix'] = $prefix . '%';
     }
-
-    if ($locationFilterInput !== '') {
-        $conditions[] = 'location LIKE :location_filter';
-        $params['location_filter'] = '%' . $locationFilterInput . '%';
-    }
-
-    if ($onlyFreeInput) {
-        $conditions[] = 'alias = :free_alias COLLATE NOCASE AND (host_name IS NULL OR host_name = "")';
-        $params['free_alias'] = 'LIBRE';
-        if ($freeSegmentFilter !== null) {
-            if (str_starts_with($freeSegmentFilter, 'THIRD_OCTET:')) {
-                $freeOctet = (int) substr($freeSegmentFilter, strlen('THIRD_OCTET:'));
-                $conditions[] = 'CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :free_octet';
-                $params['free_octet'] = $freeOctet;
-            } else {
-                [$fa, $fb, $fc] = explode('.', explode('.0/24', $freeSegmentFilter)[0]);
-                $freePrefix = sprintf('%s.%s.%s.', $fa, $fb, $fc);
-                $conditions[] = 'ip_address LIKE :free_prefix';
-                $params['free_prefix'] = $freePrefix . '%';
-            }
-        }
-    }
-
-    if ($conditions) {
-        $baseSql .= ' WHERE ' . implode(' AND ', $conditions);
-    }
-
-    $countStmt = db()->prepare('SELECT COUNT(*) ' . $baseSql);
-    $countStmt->execute($params);
-    $totalRows = (int) $countStmt->fetchColumn();
-    $totalPages = max(1, (int) ceil($totalRows / $perPage));
-    $currentPage = min($pageInput, $totalPages);
-    $offset = ($currentPage - 1) * $perPage;
-
-    $sql = 'SELECT * ' . $baseSql . ' ORDER BY ip_address LIMIT :limit OFFSET :offset';
-    $stmt = db()->prepare($sql);
-    foreach ($params as $key => $value) {
-        $stmt->bindValue(':' . $key, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
-    }
-    $stmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
-    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-    $stmt->execute();
-    $rows = $stmt->fetchAll();
-    usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
-
-    foreach ($rows as &$row) {
-        $row['segment'] = compute_segment($row['ip_address']);
-    }
-    unset($row);
 }
 
 if ($ipFilterInput !== '') {
@@ -1168,49 +1012,25 @@ $stmt->execute($params);
 $rows = $stmt->fetchAll();
 usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
 
-$ipsQuery = $_GET;
-$ipsQuery['view'] = 'ips';
-unset($ipsQuery['page']);
-$prevPageUrl = 'index.php?' . http_build_query($ipsQuery + ['page' => max(1, $currentPage - 1)]);
-$nextPageUrl = 'index.php?' . http_build_query($ipsQuery + ['page' => min($totalPages, $currentPage + 1)]);
-
-$segmentStats = [];
-$dashboardSegment = trim((string) ($_GET['dashboard_segment'] ?? ''));
-$dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
-$dashboardUsedPct = 0;
-$dashboardSegmentOctet = '';
-if ($view === 'dashboard') {
-    $segmentStats = load_dashboard_segment_stats();
-
-    if ($dashboardSegment === '' && $segmentStats) {
-        $dashboardSegment = $segmentStats[0]['segment'];
-    }
-
-    $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
-    foreach ($segmentStats as $seg) {
-        if ($seg['segment'] === $dashboardSegment) {
-            $dashboardData = $seg;
-            break;
-        }
-    }
-
-    $dashboardUsedPct = min(100, max(0, (int) round(($dashboardData['used'] / 254) * 100)));
-    if ($dashboardData['segment'] !== '' && str_contains($dashboardData['segment'], '.')) {
-        $parts = explode('.', $dashboardData['segment']);
-        if (isset($parts[2])) {
-            $dashboardSegmentOctet = $parts[2];
-        }
-    }
+foreach ($rows as &$row) {
+    $row['segment'] = compute_segment($row['ip_address']);
 }
+unset($row);
 
-$allIpRows = db()->query('SELECT ip_address FROM ip_registry ORDER BY ip_address')->fetchAll();
+$allIpRows = db()->query('SELECT ip_address, alias, host_name FROM ip_registry ORDER BY ip_address')->fetchAll();
 $segmentStatsMap = [];
 foreach ($allIpRows as $ipRow) {
     $segment = compute_segment($ipRow['ip_address']);
     if (!isset($segmentStatsMap[$segment])) {
         $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
     }
-    $segmentStatsMap[$segment]['used']++;
+
+    $alias = strtoupper(trim((string) ($ipRow['alias'] ?? '')));
+    $hostname = trim((string) ($ipRow['host_name'] ?? ''));
+    $isFreePlaceholder = $alias === 'LIBRE' && $hostname === '';
+    if (!$isFreePlaceholder) {
+        $segmentStatsMap[$segment]['used']++;
+    }
 }
 foreach ($segmentStatsMap as &$segmentData) {
     $segmentData['free'] = max(0, 254 - $segmentData['used']);
@@ -1318,16 +1138,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                         </select>
                                     </label>
                                     <button type="submit" class="btn small">Aplicar</button>
-                                </form>
-                                <form method="post" class="form-grid compact">
-                                    <input type="hidden" name="action" value="toggle_web_maintenance" />
-                                    <label>
-                                        Auto-refresh web
-                                        <input type="text" value="<?= ($webMaintenanceEnabled ?? false) ? 'Activado' : 'Desactivado' ?>" readonly>
-                                    </label>
-                                    <button type="submit" class="btn small">
-                                        <?= ($webMaintenanceEnabled ?? false) ? 'Desactivar' : 'Activar' ?>
-                                    </button>
                                 </form>
                             </div>
                         </div>
@@ -1471,15 +1281,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 </label>
                 <div class="form-end">
                     <button type="submit" class="btn small">Aplicar</button>
-                    <div class="libres-control">
-                        <button type="submit" name="only_free" value="1" class="btn small <?= $onlyFreeInput ? 'primary' : '' ?>">Libres</button>
-                        <select name="free_segment" aria-label="Segmento para filtro de libres" class="libres-segment-select">
-                            <option value="">Todos</option>
-                            <?php foreach ($freeSegmentOptions as $freeSegOption): ?>
-                                <option value="<?= h($freeSegOption) ?>" <?= $freeSegmentInput === $freeSegOption ? 'selected' : '' ?>><?= h($freeSegOption) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
                 </div>
             </form>
@@ -1489,10 +1290,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             <div class="card-title-row">
                 <h2>IPs registradas</h2>
                 <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
-            </div>
-            <div class="muted">
-                Mostrando <?= h((string) count($rows)) ?> de <?= h((string) $totalRows) ?> resultados.
-                Página <?= h((string) $currentPage) ?> de <?= h((string) $totalPages) ?>.
             </div>
             <div class="table-wrap">
                 <table>
@@ -1519,18 +1316,13 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                 <td>
                                     Alias: <?= h($row['alias'] ?: '-') ?><br>
                                     Nombre: <?= h($row['host_name'] ?: '-') ?><br>
-                                    <?php if ($onlyFreeInput): ?>
-                                        Segmento: <?= h($row['segment'] ?? compute_segment($row['ip_address'])) ?><br>
-                                        Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                                    <?php else: ?>
-                                        Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                        Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                        Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                        Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
-                                        Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
-                                        Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                                    <?php endif; ?>
-                                </td>
+                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
+                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
+                                Notas: <?= h($row['notes'] ?: '-') ?><br>
+                                Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
+                                Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
+                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
+                            </td>
                                 <td>
                                     <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
                                     <span class="status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
@@ -1550,21 +1342,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     </tbody>
                 </table>
             </div>
-            <?php if ($totalPages > 1): ?>
-                <div class="table-pagination">
-                    <?php if ($currentPage > 1): ?>
-                        <a class="btn small" href="<?= h($prevPageUrl) ?>">← Anterior</a>
-                    <?php else: ?>
-                        <span class="btn small" aria-disabled="true">← Anterior</span>
-                    <?php endif; ?>
-
-                    <?php if ($currentPage < $totalPages): ?>
-                        <a class="btn small" href="<?= h($nextPageUrl) ?>">Siguiente →</a>
-                    <?php else: ?>
-                        <span class="btn small" aria-disabled="true">Siguiente →</span>
-                    <?php endif; ?>
-                </div>
-            <?php endif; ?>
         </section>
 
         <?php if ($detail): ?>
