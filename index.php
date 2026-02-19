@@ -12,6 +12,8 @@ const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
 const ENABLE_WEB_MAINTENANCE_DEFAULT = false;
+const DASHBOARD_STATS_CACHE_KEY = 'dashboard_segment_stats_v1';
+const DASHBOARD_STATS_CACHE_TTL_SECONDS = 20;
 
 session_start();
 
@@ -169,6 +171,45 @@ function set_app_setting(string $key, string $value): void
     ]);
 }
 
+function cache_enabled(): bool
+{
+    if (!function_exists('apcu_fetch') || !function_exists('apcu_store')) {
+        return false;
+    }
+
+    $enabled = strtolower((string) ini_get('apc.enabled'));
+    if (!in_array($enabled, ['1', 'on', 'true'], true)) {
+        return false;
+    }
+
+    if (PHP_SAPI === 'cli') {
+        $enabledCli = strtolower((string) ini_get('apc.enable_cli'));
+        return in_array($enabledCli, ['1', 'on', 'true'], true);
+    }
+
+    return true;
+}
+
+function cache_get(string $key, mixed $default = null): mixed
+{
+    if (!cache_enabled()) {
+        return $default;
+    }
+
+    $success = false;
+    $value = apcu_fetch($key, $success);
+    return $success ? $value : $default;
+}
+
+function cache_set(string $key, mixed $value, int $ttlSeconds = 15): void
+{
+    if (!cache_enabled()) {
+        return;
+    }
+
+    apcu_store($key, $value, max(1, $ttlSeconds));
+}
+
 function current_user(): ?array
 {
     if (empty($_SESSION['username'])) {
@@ -309,6 +350,46 @@ function compute_segment(string $ip): string
 function is_free_alias(?string $alias): bool
 {
     return strtoupper(trim((string) $alias)) === 'LIBRE';
+}
+
+function is_effectively_free_ip(?string $alias, ?string $hostName): bool
+{
+    if (!is_free_alias($alias)) {
+        return false;
+    }
+
+    return trim((string) $hostName) === '';
+}
+
+function load_dashboard_segment_stats(): array
+{
+    $cached = cache_get(DASHBOARD_STATS_CACHE_KEY, null);
+    if (is_array($cached)) {
+        return $cached;
+    }
+
+    $allIpRows = db()->query('SELECT ip_address, alias, host_name FROM ip_registry ORDER BY ip_address')->fetchAll();
+    $segmentStatsMap = [];
+    foreach ($allIpRows as $ipRow) {
+        $segment = compute_segment($ipRow['ip_address']);
+        if (!isset($segmentStatsMap[$segment])) {
+            $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
+        }
+
+        if (!is_effectively_free_ip($ipRow['alias'] ?? null, $ipRow['host_name'] ?? null)) {
+            $segmentStatsMap[$segment]['used']++;
+        }
+    }
+
+    foreach ($segmentStatsMap as &$segmentData) {
+        $segmentData['free'] = max(0, 254 - $segmentData['used']);
+    }
+    unset($segmentData);
+
+    $segmentStats = array_values($segmentStatsMap);
+    usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
+    cache_set(DASHBOARD_STATS_CACHE_KEY, $segmentStats, DASHBOARD_STATS_CACHE_TTL_SECONDS);
+    return $segmentStats;
 }
 
 function parse_hostname_from_output(string $output): ?string
@@ -496,9 +577,14 @@ function count_ips_in_prefix(string $prefix): int
     return (int) $stmt->fetchColumn();
 }
 
-function insert_free_placeholder_ip(string $ip, string $createdBy): bool
+function insert_free_placeholder_ip(string $ip, string $createdBy, ?string $detectedHostName = null): bool
 {
     $timestamp = now_iso();
+    $resolvedHostName = trim((string) $detectedHostName);
+    $alias = $resolvedHostName === '' ? 'LIBRE' : '';
+    $output = $resolvedHostName === ''
+        ? 'No responde (placeholder primer escaneo)'
+        : 'No responde, pero se detectó nombre';
     try {
         $stmt = db()->prepare('INSERT INTO ip_registry (
             ip_address, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
@@ -507,12 +593,12 @@ function insert_free_placeholder_ip(string $ip, string $createdBy): bool
         )');
         $stmt->execute([
             'ip_address' => $ip,
-            'alias' => 'LIBRE',
-            'host_name' => '',
+            'alias' => $alias,
+            'host_name' => $resolvedHostName,
             'location' => '',
             'last_ping_at' => $timestamp,
             'last_status' => 'ERROR',
-            'last_output' => 'No responde (placeholder primer escaneo)',
+            'last_output' => $output,
             'created_at' => $timestamp,
             'created_by' => $createdBy,
         ]);
@@ -520,6 +606,23 @@ function insert_free_placeholder_ip(string $ip, string $createdBy): bool
     } catch (PDOException) {
         return false;
     }
+}
+
+function clear_free_alias_when_name_detected(string $ip, string $hostName): void
+{
+    $resolvedHostName = trim($hostName);
+    if ($resolvedHostName === '') {
+        return;
+    }
+
+    $stmt = db()->prepare('UPDATE ip_registry
+        SET alias = CASE WHEN UPPER(TRIM(alias)) = "LIBRE" THEN "" ELSE alias END,
+            host_name = COALESCE(NULLIF(host_name, ""), :host_name)
+        WHERE ip_address = :ip_address');
+    $stmt->execute([
+        'host_name' => $resolvedHostName,
+        'ip_address' => $ip,
+    ]);
 }
 
 function run_due_auto_pings(int $limit = 1): void
@@ -594,9 +697,14 @@ function run_segment_scan(string $prefix, string $createdBy): array
 
         $ip = $prefix . '.' . $host;
         $result = ping_ip($ip, false, 250);
+        $detectedHostName = trim((string) ($result['hostname'] ?? ''));
         if ($result['status'] !== 'OK') {
+            if ($detectedHostName !== '') {
+                clear_free_alias_when_name_detected($ip, $detectedHostName);
+            }
+
             if ($seedOfflineAsFree) {
-                if (insert_free_placeholder_ip($ip, $createdBy)) {
+                if (insert_free_placeholder_ip($ip, $createdBy, $detectedHostName)) {
                     $markedFree++;
                 }
             }
@@ -1057,23 +1165,7 @@ $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
 $dashboardUsedPct = 0;
 $dashboardSegmentOctet = '';
 if ($view === 'dashboard') {
-    $allIpRows = db()->query('SELECT ip_address, alias FROM ip_registry ORDER BY ip_address')->fetchAll();
-    $segmentStatsMap = [];
-    foreach ($allIpRows as $ipRow) {
-        $segment = compute_segment($ipRow['ip_address']);
-        if (!isset($segmentStatsMap[$segment])) {
-            $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
-        }
-        if (!is_free_alias($ipRow['alias'] ?? null)) {
-            $segmentStatsMap[$segment]['used']++;
-        }
-    }
-    foreach ($segmentStatsMap as &$segmentData) {
-        $segmentData['free'] = max(0, 254 - $segmentData['used']);
-    }
-    unset($segmentData);
-    $segmentStats = array_values($segmentStatsMap);
-    usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
+    $segmentStats = load_dashboard_segment_stats();
 
     if ($dashboardSegment === '' && $segmentStats) {
         $dashboardSegment = $segmentStats[0]['segment'];
