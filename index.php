@@ -11,9 +11,6 @@ const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
-const ENABLE_WEB_MAINTENANCE_DEFAULT = false;
-const DASHBOARD_STATS_CACHE_KEY = 'dashboard_segment_stats_v1';
-const DASHBOARD_STATS_CACHE_TTL_SECONDS = 20;
 
 session_start();
 
@@ -173,45 +170,6 @@ function set_app_setting(string $key, string $value): void
         'setting_key' => $key,
         'setting_value' => $value,
     ]);
-}
-
-function cache_enabled(): bool
-{
-    if (!function_exists('apcu_fetch') || !function_exists('apcu_store')) {
-        return false;
-    }
-
-    $enabled = strtolower((string) ini_get('apc.enabled'));
-    if (!in_array($enabled, ['1', 'on', 'true'], true)) {
-        return false;
-    }
-
-    if (PHP_SAPI === 'cli') {
-        $enabledCli = strtolower((string) ini_get('apc.enable_cli'));
-        return in_array($enabledCli, ['1', 'on', 'true'], true);
-    }
-
-    return true;
-}
-
-function cache_get(string $key, mixed $default = null): mixed
-{
-    if (!cache_enabled()) {
-        return $default;
-    }
-
-    $success = false;
-    $value = apcu_fetch($key, $success);
-    return $success ? $value : $default;
-}
-
-function cache_set(string $key, mixed $value, int $ttlSeconds = 15): void
-{
-    if (!cache_enabled()) {
-        return;
-    }
-
-    apcu_store($key, $value, max(1, $ttlSeconds));
 }
 
 function current_user(): ?array
@@ -439,7 +397,7 @@ function probe_uptime(string $ip): ?string
     return null;
 }
 
-function ping_ip(string $ip, bool $allowDnsFallback = true, int $timeoutMs = 1000): array
+function ping_ip(string $ip): array
 {
     $isWindows = strtoupper(substr(PHP_OS_FAMILY, 0, 3)) === 'WIN';
     if ($isWindows) {
@@ -581,14 +539,9 @@ function count_ips_in_prefix(string $prefix): int
     return (int) $stmt->fetchColumn();
 }
 
-function insert_free_placeholder_ip(string $ip, string $createdBy, ?string $detectedHostName = null): bool
+function insert_free_placeholder_ip(string $ip, string $createdBy): bool
 {
     $timestamp = now_iso();
-    $resolvedHostName = trim((string) $detectedHostName);
-    $alias = $resolvedHostName === '' ? 'LIBRE' : '';
-    $output = $resolvedHostName === ''
-        ? 'No responde (placeholder primer escaneo)'
-        : 'No responde, pero se detectó nombre';
     try {
         $stmt = db()->prepare('INSERT INTO ip_registry (
             ip_address, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
@@ -597,12 +550,12 @@ function insert_free_placeholder_ip(string $ip, string $createdBy, ?string $dete
         )');
         $stmt->execute([
             'ip_address' => $ip,
-            'alias' => $alias,
-            'host_name' => $resolvedHostName,
+            'alias' => 'LIBRE',
+            'host_name' => '',
             'location' => '',
             'last_ping_at' => $timestamp,
             'last_status' => 'ERROR',
-            'last_output' => $output,
+            'last_output' => 'No responde (placeholder primer escaneo)',
             'created_at' => $timestamp,
             'created_by' => $createdBy,
         ]);
@@ -610,23 +563,6 @@ function insert_free_placeholder_ip(string $ip, string $createdBy, ?string $dete
     } catch (PDOException) {
         return false;
     }
-}
-
-function clear_free_alias_when_name_detected(string $ip, string $hostName): void
-{
-    $resolvedHostName = trim($hostName);
-    if ($resolvedHostName === '') {
-        return;
-    }
-
-    $stmt = db()->prepare('UPDATE ip_registry
-        SET alias = CASE WHEN UPPER(TRIM(alias)) = "LIBRE" THEN "" ELSE alias END,
-            host_name = COALESCE(NULLIF(host_name, ""), :host_name)
-        WHERE ip_address = :ip_address');
-    $stmt->execute([
-        'host_name' => $resolvedHostName,
-        'ip_address' => $ip,
-    ]);
 }
 
 function run_due_auto_pings(int $limit = 1): void
@@ -682,11 +618,6 @@ function resolve_auto_scan_prefix(): ?string
 
 function run_segment_scan(string $prefix, string $createdBy): array
 {
-    @ini_set('max_execution_time', '0');
-    if (function_exists('set_time_limit')) {
-        @set_time_limit(0);
-    }
-
     $foundOnline = 0;
     $inserted = 0;
     $updated = 0;
@@ -695,20 +626,11 @@ function run_segment_scan(string $prefix, string $createdBy): array
     $seedOfflineAsFree = $existingInSegment === 0;
 
     for ($host = 1; $host <= 254; $host++) {
-        if ($host % 25 === 0 && function_exists('set_time_limit')) {
-            @set_time_limit(0);
-        }
-
         $ip = $prefix . '.' . $host;
-        $result = ping_ip($ip, true, 250);
-        $detectedHostName = trim((string) ($result['hostname'] ?? ''));
+        $result = ping_ip($ip);
         if ($result['status'] !== 'OK') {
-            if ($detectedHostName !== '') {
-                clear_free_alias_when_name_detected($ip, $detectedHostName);
-            }
-
             if ($seedOfflineAsFree) {
-                if (insert_free_placeholder_ip($ip, $createdBy, $detectedHostName)) {
+                if (insert_free_placeholder_ip($ip, $createdBy)) {
                     $markedFree++;
                 }
             }
@@ -808,12 +730,7 @@ if (PHP_SAPI === 'cli') {
     }
 }
 
-if (PHP_SAPI !== 'cli') {
-    $webMaintenanceEnabled = get_app_setting('enable_web_maintenance', ENABLE_WEB_MAINTENANCE_DEFAULT ? '1' : '0') === '1';
-    if ($webMaintenanceEnabled) {
-        run_background_maintenance();
-    }
-}
+run_background_maintenance();
 
 $action = $_POST['action'] ?? $_GET['action'] ?? null;
 $user = current_user();
@@ -893,14 +810,6 @@ if ($action === 'set_wallpaper') {
     $allowed = list_wallpapers();
     if ($choice === '' || in_array($choice, $allowed, true)) {
         set_app_setting('login_wallpaper', $choice);
-    }
-    redirect('index.php');
-}
-
-if ($action === 'toggle_web_maintenance') {
-    if ($user['role'] !== ROLE_ADMIN) {
-        flash('Solo admin puede cambiar auto-refresh.', 'error');
-        redirect('index.php');
     }
 
     $current = get_app_setting('enable_web_maintenance', ENABLE_WEB_MAINTENANCE_DEFAULT ? '1' : '0') === '1';
@@ -1117,11 +1026,6 @@ if ($action === 'ping_all') {
     redirect('index.php?view=ips');
 }
 
-$view = trim((string) ($_GET['view'] ?? 'dashboard'));
-if (!in_array($view, ['dashboard', 'ips'], true)) {
-    $view = 'dashboard';
-}
-
 $segmentFilterInput = trim((string) ($_GET['segment'] ?? ''));
 $segmentFilter = normalize_segment_filter($segmentFilterInput);
 $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
@@ -1174,6 +1078,20 @@ if ($view === 'ips') {
             $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
             $params['name_filter'] = '%' . $nameFilterInput . '%';
         }
+
+$sql = 'SELECT * FROM ip_registry';
+$params = [];
+$conditions = [];
+if ($segmentFilter !== null) {
+    if (str_starts_with($segmentFilter, 'THIRD_OCTET:')) {
+        $octet = (int) substr($segmentFilter, strlen('THIRD_OCTET:'));
+        $conditions[] = 'CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :octet';
+        $params['octet'] = $octet;
+    } else {
+        [$a, $b, $c] = explode('.', explode('.0/24', $segmentFilter)[0]);
+        $prefix = sprintf('%s.%s.%s.', $a, $b, $c);
+        $conditions[] = 'ip_address LIKE :prefix';
+        $params['prefix'] = $prefix . '%';
     }
 
     if ($locationFilterInput !== '') {
@@ -1226,6 +1144,30 @@ if ($view === 'ips') {
     unset($row);
 }
 
+if ($ipFilterInput !== '') {
+    $conditions[] = 'ip_address LIKE :ip_filter';
+    $params['ip_filter'] = '%' . $ipFilterInput . '%';
+}
+
+if ($nameFilterInput !== '') {
+    $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
+    $params['name_filter'] = '%' . $nameFilterInput . '%';
+}
+
+if ($locationFilterInput !== '') {
+    $conditions[] = 'location LIKE :location_filter';
+    $params['location_filter'] = '%' . $locationFilterInput . '%';
+}
+
+if ($conditions) {
+    $sql .= ' WHERE ' . implode(' AND ', $conditions);
+}
+$sql .= ' ORDER BY ip_address';
+$stmt = db()->prepare($sql);
+$stmt->execute($params);
+$rows = $stmt->fetchAll();
+usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
+
 $ipsQuery = $_GET;
 $ipsQuery['view'] = 'ips';
 unset($ipsQuery['page']);
@@ -1261,6 +1203,44 @@ if ($view === 'dashboard') {
     }
 }
 
+$allIpRows = db()->query('SELECT ip_address FROM ip_registry ORDER BY ip_address')->fetchAll();
+$segmentStatsMap = [];
+foreach ($allIpRows as $ipRow) {
+    $segment = compute_segment($ipRow['ip_address']);
+    if (!isset($segmentStatsMap[$segment])) {
+        $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
+    }
+    $segmentStatsMap[$segment]['used']++;
+}
+foreach ($segmentStatsMap as &$segmentData) {
+    $segmentData['free'] = max(0, 254 - $segmentData['used']);
+}
+unset($segmentData);
+$segmentStats = array_values($segmentStatsMap);
+usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
+
+$dashboardSegment = trim((string) ($_GET['dashboard_segment'] ?? ''));
+if ($dashboardSegment === '' && $segmentStats) {
+    $dashboardSegment = $segmentStats[0]['segment'];
+}
+
+$dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
+foreach ($segmentStats as $seg) {
+    if ($seg['segment'] === $dashboardSegment) {
+        $dashboardData = $seg;
+        break;
+    }
+}
+
+$dashboardUsedPct = min(100, max(0, (int) round(($dashboardData['used'] / 254) * 100)));
+$dashboardSegmentOctet = '';
+if ($dashboardData['segment'] !== '' && str_contains($dashboardData['segment'], '.')) {
+    $parts = explode('.', $dashboardData['segment']);
+    if (isset($parts[2])) {
+        $dashboardSegmentOctet = $parts[2];
+    }
+}
+
 $detailIp = trim((string) ($_GET['ip'] ?? ''));
 $detail = null;
 $history = [];
@@ -1291,6 +1271,10 @@ $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
 $showEditUserModal = $user['role'] === ROLE_ADMIN && $modal === 'edit_user';
 $showResetPasswordModal = $user['role'] === ROLE_ADMIN && $modal === 'reset_password';
 $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
+$view = trim((string) ($_GET['view'] ?? 'dashboard'));
+if (!in_array($view, ['dashboard', 'ips'], true)) {
+    $view = 'dashboard';
+}
 $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 ?>
 <!doctype html>
