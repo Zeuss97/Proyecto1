@@ -1131,7 +1131,7 @@ $onlyFreeInput = (string) ($_GET['only_free'] ?? '') === '1';
 $freeSegmentInput = trim((string) ($_GET['free_segment'] ?? ''));
 $freeSegmentFilter = normalize_segment_filter($freeSegmentInput);
 $pageInput = max(1, (int) ($_GET['page'] ?? 1));
-$perPage = $onlyFreeInput ? 120 : 200;
+$perPage = $onlyFreeInput ? 60 : 200;
 $totalRows = 0;
 $totalPages = 1;
 $currentPage = 1;
@@ -1535,13 +1535,18 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                 <td>
                                     Alias: <?= h($row['alias'] ?: '-') ?><br>
                                     Nombre: <?= h($row['host_name'] ?: '-') ?><br>
-                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
-                                Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
-                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                            </td>
+                                    <?php if ($onlyFreeInput): ?>
+                                        Segmento: <?= h($row['segment'] ?? compute_segment($row['ip_address'])) ?><br>
+                                        Registrado por: <?= h($row['created_by'] ?: '-') ?>
+                                    <?php else: ?>
+                                        Tipo: <?= h($row['host_type'] ?: '-') ?><br>
+                                        Ubicación: <?= h($row['location'] ?: '-') ?><br>
+                                        Notas: <?= h($row['notes'] ?: '-') ?><br>
+                                        Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
+                                        Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
+                                        Registrado por: <?= h($row['created_by'] ?: '-') ?>
+                                    <?php endif; ?>
+                                </td>
                                 <td>
                                     <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
                                     <span class="status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
