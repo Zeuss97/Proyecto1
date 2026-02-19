@@ -84,6 +84,61 @@ schtasks /Query /TN "IP-Checker-Worker" /V /FO LIST
 - Si quieres forzar que el scan diario apunte a un segmento específico,
   guarda en `app_settings` la clave `auto_scan_segment` (ejemplo: `192.168.56.0/24`).
 
+## Mejoras de rendimiento (OPcache + APCu)
+
+Para mejorar tiempos de respuesta en navegación y dashboard:
+
+- **OPcache** acelera ejecución de PHP (bytecode cache).
+- **APCu** habilita caché en memoria para estadísticas del dashboard (con fallback automático si APCu no está instalado).
+
+### 1) Activar OPcache en XAMPP
+
+En `C:\xampp\php\php.ini`, verifica:
+
+```ini
+[opcache]
+zend_extension=opcache
+opcache.enable=1
+opcache.enable_cli=0
+opcache.memory_consumption=192
+opcache.interned_strings_buffer=16
+opcache.max_accelerated_files=20000
+opcache.validate_timestamps=1
+opcache.revalidate_freq=2
+```
+
+### 2) Activar APCu en XAMPP
+
+1. Copia la DLL compatible (`php_apcu.dll`) en `C:\xampp\php\ext\`.
+2. En `php.ini` agrega:
+
+```ini
+extension=php_apcu.dll
+
+[apcu]
+apc.enabled=1
+apc.shm_size=128M
+apc.ttl=300
+apc.gc_ttl=300
+apc.entries_hint=4096
+; opcional para CLI (si quieres cache también en `php index.php worker`)
+apc.enable_cli=0
+```
+
+3. Reinicia Apache desde XAMPP.
+
+### 3) Verificar módulos
+
+```bat
+C:\xampp\php\php.exe -m | findstr /I "opcache apcu"
+C:\xampp\php\php.exe -i | findstr /I "opcache.enable apc.enabled"
+```
+
+### 4) Ajuste recomendado de operación
+
+- Mantener `php index.php worker` programado por Task Scheduler.
+- Dejar deshabilitado el mantenimiento por request web (setting `enable_web_maintenance=0`) para menor latencia de UI.
+
 ## Credenciales demo
 
 - Usuario: `admin`
@@ -96,9 +151,3 @@ Coloca archivos en:
 - `wallpaper/`
 
 Luego en la app, en **Personalizar fondo**, selecciona el archivo y aplica.
-
-
-## ¿Dónde se guardan los datos?
-
-- Se guardan en `data/ips.db` (SQLite).
-- Sí, la carpeta `data/` se **autocrea** en el arranque de la app.
