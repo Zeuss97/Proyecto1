@@ -1124,6 +1124,15 @@ $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
 $nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
 $locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
 $onlyFreeInput = (string) ($_GET['only_free'] ?? '') === '1';
+$freeSegmentInput = trim((string) ($_GET['free_segment'] ?? ''));
+$freeSegmentFilter = normalize_segment_filter($freeSegmentInput);
+$freeSegmentOptions = [];
+foreach (load_dashboard_segment_stats() as $seg) {
+    $segmentValue = (string) ($seg['segment'] ?? '');
+    if ($segmentValue !== '' && $segmentValue !== '-') {
+        $freeSegmentOptions[] = $segmentValue;
+    }
+}
 
 $rows = [];
 if ($view === 'ips') {
@@ -1160,6 +1169,18 @@ if ($view === 'ips') {
 
     if ($onlyFreeInput) {
         $conditions[] = 'UPPER(TRIM(COALESCE(alias, ""))) = "LIBRE" AND TRIM(COALESCE(host_name, "")) = ""';
+        if ($freeSegmentFilter !== null) {
+            if (str_starts_with($freeSegmentFilter, 'THIRD_OCTET:')) {
+                $freeOctet = (int) substr($freeSegmentFilter, strlen('THIRD_OCTET:'));
+                $conditions[] = 'CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) = :free_octet';
+                $params['free_octet'] = $freeOctet;
+            } else {
+                [$fa, $fb, $fc] = explode('.', explode('.0/24', $freeSegmentFilter)[0]);
+                $freePrefix = sprintf('%s.%s.%s.', $fa, $fb, $fc);
+                $conditions[] = 'ip_address LIKE :free_prefix';
+                $params['free_prefix'] = $freePrefix . '%';
+            }
+        }
     }
 
     if ($conditions) {
@@ -1432,6 +1453,14 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 </label>
                 <div class="form-end">
                     <button type="submit" class="btn small">Aplicar</button>
+                    <label>Segmento libres
+                        <select name="free_segment">
+                            <option value="">Segmento libres</option>
+                            <?php foreach ($freeSegmentOptions as $freeSegOption): ?>
+                                <option value="<?= h($freeSegOption) ?>" <?= $freeSegmentInput === $freeSegOption ? 'selected' : '' ?>><?= h($freeSegOption) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
                     <button type="submit" name="only_free" value="1" class="btn small <?= $onlyFreeInput ? 'primary' : '' ?>">Libres</button>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
                 </div>
