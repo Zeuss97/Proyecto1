@@ -460,7 +460,7 @@ function ping_ip(string $ip, bool $allowDnsFallback = true, int $timeoutMs = 100
 
     $output = trim(implode(PHP_EOL, $outputLines));
     $hostname = parse_hostname_from_output($output);
-    if ($allowDnsFallback && $hostname === null) {
+    if ($allowDnsFallback && $exitCode === 0 && $hostname === null) {
         $resolved = @gethostbyaddr($ip);
         if ($resolved !== false && $resolved !== $ip) {
             $hostname = $resolved;
@@ -696,7 +696,7 @@ function run_segment_scan(string $prefix, string $createdBy): array
         }
 
         $ip = $prefix . '.' . $host;
-        $result = ping_ip($ip, false, 250);
+        $result = ping_ip($ip, true, 250);
         $detectedHostName = trim((string) ($result['hostname'] ?? ''));
         if ($result['status'] !== 'OK') {
             if ($detectedHostName !== '') {
@@ -890,6 +890,19 @@ if ($action === 'set_wallpaper') {
     if ($choice === '' || in_array($choice, $allowed, true)) {
         set_app_setting('login_wallpaper', $choice);
     }
+    redirect('index.php');
+}
+
+if ($action === 'toggle_web_maintenance') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede cambiar auto-refresh.', 'error');
+        redirect('index.php');
+    }
+
+    $current = get_app_setting('enable_web_maintenance', ENABLE_WEB_MAINTENANCE_DEFAULT ? '1' : '0') === '1';
+    $next = $current ? '0' : '1';
+    set_app_setting('enable_web_maintenance', $next);
+    flash('Auto-refresh de mantenimiento ' . ($next === '1' ? 'activado' : 'desactivado') . '.', 'success');
     redirect('index.php');
 }
 
@@ -1261,6 +1274,16 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                         </select>
                                     </label>
                                     <button type="submit" class="btn small">Aplicar</button>
+                                </form>
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="toggle_web_maintenance" />
+                                    <label>
+                                        Auto-refresh web
+                                        <input type="text" value="<?= ($webMaintenanceEnabled ?? false) ? 'Activado' : 'Desactivado' ?>" readonly>
+                                    </label>
+                                    <button type="submit" class="btn small">
+                                        <?= ($webMaintenanceEnabled ?? false) ? 'Desactivar' : 'Activar' ?>
+                                    </button>
                                 </form>
                             </div>
                         </div>
