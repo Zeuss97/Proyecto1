@@ -460,17 +460,6 @@ function apply_tcp_fallback(string $ip, array $icmpResult, int $timeoutMs): arra
     return finalize_ping_result($ip, $icmpResult);
 }
 
-function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
-{
-    $timeoutMs = clamp_int($timeoutMs, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
-    $icmpResult = run_icmp_ping($ip, $timeoutMs);
-    if ($icmpResult['status'] === 'OK') {
-        return finalize_ping_result($ip, $icmpResult);
-    }
-
-    return apply_tcp_fallback($ip, $icmpResult, $timeoutMs);
-}
-
 function start_async_icmp_ping(string $ip, int $timeoutMs)
 {
     $command = build_icmp_ping_command($ip, $timeoutMs);
