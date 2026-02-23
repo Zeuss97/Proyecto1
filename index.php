@@ -1274,7 +1274,7 @@ $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
 $nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
 $locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
 $statusFilterInput = strtolower(trim((string) ($_GET['status_filter'] ?? 'all')));
-$allowedStatusFilters = ['all', 'ok', 'error', 'unknown'];
+$allowedStatusFilters = ['all', 'ok', 'error'];
 if (!in_array($statusFilterInput, $allowedStatusFilters, true)) {
     $statusFilterInput = 'all';
 }
@@ -1323,8 +1323,6 @@ if ($statusFilterInput === 'ok') {
     $conditions[] = 'UPPER(COALESCE(last_status, "")) = "OK"';
 } elseif ($statusFilterInput === 'error') {
     $conditions[] = 'UPPER(COALESCE(last_status, "")) = "ERROR"';
-} elseif ($statusFilterInput === 'unknown') {
-    $conditions[] = '(last_status IS NULL OR TRIM(last_status) = "" OR (UPPER(last_status) <> "OK" AND UPPER(last_status) <> "ERROR"))';
 }
 
 if ($conditions) {
@@ -1353,15 +1351,14 @@ $baseQueryParams = [
 ];
 $statusCountsSql = 'SELECT
     SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "OK" THEN 1 ELSE 0 END) AS ok_count,
-    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "ERROR" THEN 1 ELSE 0 END) AS error_count,
-    SUM(CASE WHEN last_status IS NULL OR TRIM(last_status) = "" OR (UPPER(last_status) <> "OK" AND UPPER(last_status) <> "ERROR") THEN 1 ELSE 0 END) AS unknown_count
+    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "ERROR" THEN 1 ELSE 0 END) AS error_count
     FROM ip_registry';
 if ($conditionsWithoutStatus !== []) {
     $statusCountsSql .= ' WHERE ' . implode(' AND ', $conditionsWithoutStatus);
 }
 $statusCountsStmt = db()->prepare($statusCountsSql);
 $statusCountsStmt->execute($params);
-$statusCounts = $statusCountsStmt->fetch() ?: ['ok_count' => 0, 'error_count' => 0, 'unknown_count' => 0];
+$statusCounts = $statusCountsStmt->fetch() ?: ['ok_count' => 0, 'error_count' => 0];
 
 foreach ($rows as &$row) {
     $row['segment'] = compute_segment($row['ip_address']);
@@ -1655,21 +1652,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <label>Ubicación
                     <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
                 </label>
-                <label>Estado
-                    <select name="status_filter">
-                        <option value="all" <?= $statusFilterInput === 'all' ? 'selected' : '' ?>>Todos</option>
-                        <option value="ok" <?= $statusFilterInput === 'ok' ? 'selected' : '' ?>>OK</option>
-                        <option value="error" <?= $statusFilterInput === 'error' ? 'selected' : '' ?>>ERROR</option>
-                        <option value="unknown" <?= $statusFilterInput === 'unknown' ? 'selected' : '' ?>>Sin datos</option>
-                    </select>
-                </label>
-                <label>Filas por página
-                    <select name="per_page">
-                        <?php foreach ($perPageOptions as $opt): ?>
-                            <option value="<?= h((string) $opt) ?>" <?= $perPageInput === $opt ? 'selected' : '' ?>><?= h((string) $opt) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </label>
                 <div class="form-end">
                     <button type="submit" class="btn small">Aplicar</button>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
@@ -1688,7 +1670,6 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     'all' => ['label' => 'Todos', 'count' => (int) $totalRows],
                     'ok' => ['label' => 'OK', 'count' => (int) ($statusCounts['ok_count'] ?? 0)],
                     'error' => ['label' => 'ERROR', 'count' => (int) ($statusCounts['error_count'] ?? 0)],
-                    'unknown' => ['label' => 'Sin datos', 'count' => (int) ($statusCounts['unknown_count'] ?? 0)],
                 ];
                 ?>
                 <?php foreach ($statusButtons as $statusKey => $meta): ?>
@@ -1755,7 +1736,24 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 $startRow = $totalRows === 0 ? 0 : ($offset + 1);
                 $endRow = min($offset + $perPageInput, $totalRows);
                 ?>
-                <div class="muted">Mostrando <?= h((string) $startRow) ?> a <?= h((string) $endRow) ?> de <?= h((string) $totalRows) ?> filas</div>
+                <div class="top-actions" style="gap:8px;">
+                    <div class="muted">Mostrando <?= h((string) $startRow) ?> a <?= h((string) $endRow) ?> de <?= h((string) $totalRows) ?> filas</div>
+                    <form method="get" class="top-actions" style="gap:6px;">
+                        <input type="hidden" name="view" value="ips" />
+                        <input type="hidden" name="segment" value="<?= h($segmentFilterInput) ?>" />
+                        <input type="hidden" name="ip_filter" value="<?= h($ipFilterInput) ?>" />
+                        <input type="hidden" name="name_filter" value="<?= h($nameFilterInput) ?>" />
+                        <input type="hidden" name="location_filter" value="<?= h($locationFilterInput) ?>" />
+                        <input type="hidden" name="status_filter" value="<?= h($statusFilterInput) ?>" />
+                        <input type="hidden" name="page" value="1" />
+                        <label class="muted" style="margin-top:0;">Filas</label>
+                        <select name="per_page" onchange="this.form.submit()" style="width:90px; padding:6px 8px;">
+                            <?php foreach ($perPageOptions as $opt): ?>
+                                <option value="<?= h((string) $opt) ?>" <?= $perPageInput === $opt ? 'selected' : '' ?>><?= h((string) $opt) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </form>
+                </div>
                 <div class="top-actions" style="gap:8px;">
                     <?php $prevQuery = $baseQueryParams; $prevQuery['page'] = (string) max(1, $currentPage - 1); ?>
                     <?php $nextQuery = $baseQueryParams; $nextQuery['page'] = (string) min($totalPages, $currentPage + 1); ?>
