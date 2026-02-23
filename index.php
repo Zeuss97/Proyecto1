@@ -11,12 +11,14 @@ const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
-const SCAN_POOL_SIZE = 64;
+const SCAN_POOL_SIZE = 48;
 const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
 const DEFAULT_SCAN_TIMEOUT_MS = 1000;
+const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
+const SEGMENT_SCAN_TIMEOUT_MAX_MS = 850;
+const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
 const TCP_FALLBACK_PORT = 80;
-const UDP_FALLBACK_PORT = 33434;
 
 session_start();
 
@@ -433,28 +435,6 @@ function probe_tcp_connect(string $ip, int $port, int $timeoutMs): bool
     return true;
 }
 
-function probe_udp_connect(string $ip, int $port, int $timeoutMs): bool
-{
-    $timeoutSeconds = max(0.2, $timeoutMs / 1000);
-    $errno = 0;
-    $errstr = '';
-    $socket = @stream_socket_client(
-        sprintf('udp://%s:%d', $ip, $port),
-        $errno,
-        $errstr,
-        $timeoutSeconds,
-        STREAM_CLIENT_CONNECT
-    );
-    if ($socket === false) {
-        return false;
-    }
-
-    stream_set_timeout($socket, 0, $timeoutMs * 1000);
-    @fwrite($socket, "\x00");
-    fclose($socket);
-    return true;
-}
-
 function finalize_ping_result(string $ip, array $result): array
 {
     $hostname = null;
@@ -466,29 +446,14 @@ function finalize_ping_result(string $ip, array $result): array
     return $result;
 }
 
-function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
+function apply_tcp_fallback(string $ip, array $icmpResult, int $timeoutMs): array
 {
-    $timeoutMs = clamp_int($timeoutMs, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
-    $icmpResult = run_icmp_ping($ip, $timeoutMs);
-    if ($icmpResult['status'] === 'OK') {
-        return finalize_ping_result($ip, $icmpResult);
-    }
-
     if (probe_tcp_connect($ip, TCP_FALLBACK_PORT, $timeoutMs)) {
         return finalize_ping_result($ip, [
             'status' => 'OK',
             'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('TCP fallback OK (%s:%d)', $ip, TCP_FALLBACK_PORT)),
             'latency_ms' => null,
             'method' => 'TCP',
-        ]);
-    }
-
-    if (probe_udp_connect($ip, UDP_FALLBACK_PORT, $timeoutMs)) {
-        return finalize_ping_result($ip, [
-            'status' => 'OK',
-            'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('UDP fallback OK (%s:%d)', $ip, UDP_FALLBACK_PORT)),
-            'latency_ms' => null,
-            'method' => 'UDP',
         ]);
     }
 
@@ -542,17 +507,45 @@ function finish_async_icmp_ping(array $task): array
 
 function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
 {
-    $poolSize = max(1, $poolSize);
+    $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE);
     $queue = array_values($ips);
     $running = [];
     $results = [];
     $rttSamples = [];
+    $startedAt = microtime(true);
 
     while ($queue !== [] || $running !== []) {
+        $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
+        if ($elapsedMs >= SEGMENT_SCAN_MAX_DURATION_MS) {
+            foreach ($running as $ip => $task) {
+                @proc_terminate($task['process']);
+                fclose($task['stdout']);
+                fclose($task['stderr']);
+                @proc_close($task['process']);
+                $results[$ip] = [
+                    'status' => 'ERROR',
+                    'output' => 'Escaneo cancelado por límite de tiempo del segmento',
+                    'latency_ms' => null,
+                    'method' => 'ICMP',
+                    'hostname' => null,
+                ];
+            }
+            foreach ($queue as $ip) {
+                $results[$ip] = [
+                    'status' => 'ERROR',
+                    'output' => 'Escaneo cancelado por límite de tiempo del segmento',
+                    'latency_ms' => null,
+                    'method' => 'ICMP',
+                    'hostname' => null,
+                ];
+            }
+            break;
+        }
+
         $sampleAvg = $rttSamples === []
             ? DEFAULT_SCAN_TIMEOUT_MS / 3
             : array_sum($rttSamples) / count($rttSamples);
-        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, SEGMENT_SCAN_TIMEOUT_MAX_MS);
 
         while ($queue !== [] && count($running) < $poolSize) {
             $ip = array_shift($queue);
@@ -582,7 +575,7 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
                 }
                 $results[$ip] = finalize_ping_result($ip, $icmpResult);
             } else {
-                $results[$ip] = ping_ip($ip, $dynamicTimeoutMs);
+                $results[$ip] = apply_tcp_fallback($ip, $icmpResult, $dynamicTimeoutMs);
             }
 
             unset($running[$ip]);
@@ -590,7 +583,7 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
         unset($task);
 
         if ($running !== []) {
-            usleep(20000);
+            usleep(10000);
         }
     }
 
