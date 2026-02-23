@@ -6,7 +6,8 @@ const DB_DIR = __DIR__ . '/data';
 const DB_PATH = DB_DIR . '/ips.db';
 const ROLE_ADMIN = 'admin';
 const ROLE_OPERATOR = 'operator';
-const HOST_TYPES = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
+const HOST_TYPES_DEFAULT = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
+const HOST_TYPES_KEY = 'host_types';
 const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
@@ -202,6 +203,59 @@ function get_scan_default_timeout_ms(): int
 function get_scan_segment_timeout_max_ms(): int
 {
     return get_app_setting_int(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT, SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+
+function normalize_host_type_label(string $value): string
+{
+    return strtoupper(trim($value));
+}
+
+function get_host_types(): array
+{
+    $raw = trim(get_app_setting(HOST_TYPES_KEY, ''));
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $normalized = [];
+            foreach ($decoded as $item) {
+                if (!is_string($item)) {
+                    continue;
+                }
+                $label = normalize_host_type_label($item);
+                if ($label === '') {
+                    continue;
+                }
+                $normalized[$label] = $label;
+            }
+            if ($normalized !== []) {
+                return array_values($normalized);
+            }
+        }
+    }
+
+    return HOST_TYPES_DEFAULT;
+}
+
+function save_host_types(array $types): void
+{
+    $normalized = [];
+    foreach ($types as $type) {
+        if (!is_string($type)) {
+            continue;
+        }
+        $label = normalize_host_type_label($type);
+        if ($label === '') {
+            continue;
+        }
+        $normalized[$label] = $label;
+    }
+
+    if ($normalized === []) {
+        $normalized = array_combine(HOST_TYPES_DEFAULT, HOST_TYPES_DEFAULT) ?: [];
+    }
+
+    set_app_setting(HOST_TYPES_KEY, json_encode(array_values($normalized), JSON_UNESCAPED_UNICODE));
 }
 
 function current_user(): ?array
@@ -1037,6 +1091,99 @@ if ($action === 'save_scan_profile') {
     redirect('index.php');
 }
 
+if ($action === 'add_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede crear tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $newType = normalize_host_type_label((string) ($_POST['new_host_type'] ?? ''));
+    if ($newType === '') {
+        flash('Debe indicar un tipo válido.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (in_array($newType, $types, true)) {
+        flash('El tipo ya existe.', 'info');
+        redirect('index.php');
+    }
+
+    $types[] = $newType;
+    save_host_types($types);
+    flash('Tipo de equipo agregado.', 'success');
+    redirect('index.php');
+}
+
+if ($action === 'rename_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede modificar tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $oldType = normalize_host_type_label((string) ($_POST['old_host_type'] ?? ''));
+    $newType = normalize_host_type_label((string) ($_POST['renamed_host_type'] ?? ''));
+    if ($oldType === '' || $newType === '') {
+        flash('Debe seleccionar un tipo y su nuevo nombre.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (!in_array($oldType, $types, true)) {
+        flash('El tipo seleccionado no existe.', 'error');
+        redirect('index.php');
+    }
+
+    foreach ($types as &$type) {
+        if ($type === $oldType) {
+            $type = $newType;
+        }
+    }
+    unset($type);
+    save_host_types($types);
+
+    if ($oldType !== $newType) {
+        $updateType = db()->prepare('UPDATE ip_registry SET host_type = :new_type WHERE host_type = :old_type');
+        $updateType->execute(['new_type' => $newType, 'old_type' => $oldType]);
+    }
+
+    flash('Tipo de equipo actualizado.', 'success');
+    redirect('index.php');
+}
+
+if ($action === 'delete_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede eliminar tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $deleteType = normalize_host_type_label((string) ($_POST['delete_host_type'] ?? ''));
+    if ($deleteType === '') {
+        flash('Debe seleccionar un tipo.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (!in_array($deleteType, $types, true)) {
+        flash('El tipo seleccionado no existe.', 'error');
+        redirect('index.php');
+    }
+
+    if (count($types) <= 1) {
+        flash('Debe existir al menos un tipo de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $types = array_values(array_filter($types, static fn(string $type): bool => $type !== $deleteType));
+    save_host_types($types);
+
+    $clearType = db()->prepare('UPDATE ip_registry SET host_type = "" WHERE host_type = :host_type');
+    $clearType->execute(['host_type' => $deleteType]);
+
+    flash('Tipo de equipo eliminado.', 'success');
+    redirect('index.php');
+}
+
 if ($action === 'add_ip') {
     if (!in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)) {
         flash('No tienes permisos para registrar IPs.', 'error');
@@ -1100,13 +1247,18 @@ if ($action === 'save_ip') {
         redirect('index.php');
     }
 
+    $hostType = normalize_host_type_label((string) ($_POST['host_type'] ?? ''));
+    if ($hostType !== '' && !in_array($hostType, get_host_types(), true)) {
+        $hostType = '';
+    }
+
     $stmt = db()->prepare('UPDATE ip_registry
         SET alias = :alias, host_name = :host_name, host_type = :host_type, location = :location, notes = :notes
         WHERE ip_address = :ip_address');
     $stmt->execute([
         'alias' => trim((string) ($_POST['alias'] ?? '')),
         'host_name' => trim((string) ($_POST['host_name'] ?? '')),
-        'host_type' => trim((string) ($_POST['host_type'] ?? '')),
+        'host_type' => $hostType,
         'location' => trim((string) ($_POST['location'] ?? '')),
         'notes' => trim((string) ($_POST['notes'] ?? '')),
         'ip_address' => $ip,
@@ -1433,6 +1585,7 @@ $scanProfile = [
     'default_timeout_ms' => get_scan_default_timeout_ms(),
     'segment_timeout_max_ms' => get_scan_segment_timeout_max_ms(),
 ];
+$hostTypes = get_host_types();
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -1510,6 +1663,44 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                         <input type="number" min="<?= h((string) SEGMENT_SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_segment_timeout_max_ms" value="<?= h((string) $scanProfile['segment_timeout_max_ms']) ?>">
                                     </label>
                                     <button type="submit" class="btn small">Guardar</button>
+                                </form>
+                            </div>
+                        </details>
+
+                        <details class="menu-item flyout-parent">
+                            <summary class="menu-item-title">Tipos de equipo</summary>
+                            <div class="flyout-menu">
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="add_host_type" />
+                                    <label>Nuevo tipo
+                                        <input type="text" name="new_host_type" placeholder="Ej: SWITCH" required>
+                                    </label>
+                                    <button type="submit" class="btn small">Agregar</button>
+                                </form>
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="rename_host_type" />
+                                    <label>Modificar tipo
+                                        <select name="old_host_type" required>
+                                            <?php foreach ($hostTypes as $type): ?>
+                                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </label>
+                                    <label>Nuevo nombre
+                                        <input type="text" name="renamed_host_type" required>
+                                    </label>
+                                    <button type="submit" class="btn small">Guardar</button>
+                                </form>
+                                <form method="post" class="form-grid compact" onsubmit="return confirm('¿Eliminar este tipo de equipo?');">
+                                    <input type="hidden" name="action" value="delete_host_type" />
+                                    <label>Eliminar tipo
+                                        <select name="delete_host_type" required>
+                                            <?php foreach ($hostTypes as $type): ?>
+                                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </label>
+                                    <button type="submit" class="btn small">Eliminar</button>
                                 </form>
                             </div>
                         </details>
@@ -1777,7 +1968,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <label>Tipo
                         <select name="host_type">
                             <option value="">-</option>
-                            <?php foreach (HOST_TYPES as $type): ?>
+                            <?php foreach ($hostTypes as $type): ?>
                                 <option value="<?= h($type) ?>" <?= ($detail['host_type'] === $type) ? 'selected' : '' ?>><?= h($type) ?></option>
                             <?php endforeach; ?>
                         </select>
