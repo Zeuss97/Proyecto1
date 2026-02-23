@@ -7,6 +7,7 @@ Aplicación migrada a **PHP puro** pensada para correr localmente con **XAMPP en
 - Login básico con usuario demo `admin / admin`.
 - Registro de IPs (solo admin).
 - Ping manual por IP o para todas.
+- Escaneo por segmento /24 en paralelo (pool de 64 workers) usando ping ICMP estándar para estado y Reverse DNS Lookup para hostname, con fallback TCP/UDP cuando ICMP falla.
 - Vista principal con columna **Ubicación**.
 - **Subventana de detalle** por IP (`Detalles`) con:
   - resumen completo arriba,

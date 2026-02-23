@@ -11,6 +11,12 @@ const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
+const SCAN_POOL_SIZE = 64;
+const SCAN_TIMEOUT_MIN_MS = 300;
+const SCAN_TIMEOUT_MAX_MS = 2000;
+const DEFAULT_SCAN_TIMEOUT_MS = 1000;
+const TCP_FALLBACK_PORT = 80;
+const UDP_FALLBACK_PORT = 33434;
 
 session_start();
 
@@ -201,6 +207,21 @@ function redirect(string $url): never
     exit;
 }
 
+function json_response(array $payload, int $statusCode = 200): never
+{
+    http_response_code($statusCode);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function is_json_request(): bool
+{
+    $accept = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+    $requestedWith = strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? ''));
+    return str_contains($accept, 'application/json') || $requestedWith === 'xmlhttprequest';
+}
+
 function safe_redirect_target(?string $target, string $default = 'index.php'): string
 {
     $raw = trim((string) $target);
@@ -305,17 +326,20 @@ function compute_segment(string $ip): string
     return '-';
 }
 
-function parse_hostname_from_output(string $output): ?string
+function reverse_dns_lookup(string $ip): ?string
 {
-    $lines = preg_split('/\R/', $output) ?: [];
-    foreach ($lines as $line) {
-        if (preg_match('/Pinging\s+(.+?)\s*\[/', $line, $m)) {
-            return trim($m[1]);
-        }
-        if (preg_match('/PING\s+([^\s(]+)/', $line, $m)) {
-            return trim($m[1]);
-        }
+    static $cache = [];
+    if (array_key_exists($ip, $cache)) {
+        return $cache[$ip];
     }
+
+    $resolved = @gethostbyaddr($ip);
+    if ($resolved !== false && $resolved !== $ip) {
+        $cache[$ip] = $resolved;
+        return $resolved;
+    }
+
+    $cache[$ip] = null;
     return null;
 }
 
@@ -348,37 +372,229 @@ function probe_uptime(string $ip): ?string
     return null;
 }
 
-function ping_ip(string $ip): array
+function clamp_int(int $value, int $min, int $max): int
+{
+    return max($min, min($max, $value));
+}
+
+function parse_rtt_ms_from_output(string $output): ?float
+{
+    if (preg_match('/time[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms/i', $output, $m)) {
+        return (float) $m[1];
+    }
+    return null;
+}
+
+function build_icmp_ping_command(string $ip, int $timeoutMs): string
 {
     $isWindows = strtoupper(substr(PHP_OS_FAMILY, 0, 3)) === 'WIN';
     if ($isWindows) {
-        $command = sprintf('ping -a -n 1 -w 1000 %s', escapeshellarg($ip));
-    } else {
-        $pingCmd = sprintf('ping -n -c 1 -W 1 -w 2 %s', escapeshellarg($ip));
-        $timeoutBin = trim((string) @shell_exec('command -v timeout 2>/dev/null'));
-        $command = $timeoutBin !== ''
-            ? sprintf('%s 2 %s', escapeshellcmd($timeoutBin), $pingCmd)
-            : $pingCmd;
+        return sprintf('ping -n 1 -w %d %s', $timeoutMs, escapeshellarg($ip));
     }
 
+    $timeoutSeconds = max(1, (int) ceil($timeoutMs / 1000));
+    $deadlineSeconds = $timeoutSeconds + 1;
+    $pingCmd = sprintf('ping -n -c 1 -W %d -w %d %s', $timeoutSeconds, $deadlineSeconds, escapeshellarg($ip));
+    $timeoutBin = trim((string) @shell_exec('command -v timeout 2>/dev/null'));
+
+    if ($timeoutBin !== '') {
+        return sprintf('%s %d %s', escapeshellcmd($timeoutBin), $deadlineSeconds + 1, $pingCmd);
+    }
+
+    return $pingCmd;
+}
+
+function run_icmp_ping(string $ip, int $timeoutMs): array
+{
+    $command = build_icmp_ping_command($ip, $timeoutMs);
     $outputLines = [];
     $exitCode = 1;
     @exec($command . ' 2>&1', $outputLines, $exitCode);
 
     $output = trim(implode(PHP_EOL, $outputLines));
-    $hostname = parse_hostname_from_output($output);
-    if ($hostname === null) {
-        $resolved = @gethostbyaddr($ip);
-        if ($resolved !== false && $resolved !== $ip) {
-            $hostname = $resolved;
-        }
+    return [
+        'status' => $exitCode === 0 ? 'OK' : 'ERROR',
+        'output' => $output,
+        'latency_ms' => parse_rtt_ms_from_output($output),
+        'method' => 'ICMP',
+    ];
+}
+
+function probe_tcp_connect(string $ip, int $port, int $timeoutMs): bool
+{
+    $timeoutSeconds = max(0.2, $timeoutMs / 1000);
+    $errno = 0;
+    $errstr = '';
+    $socket = @fsockopen($ip, $port, $errno, $errstr, $timeoutSeconds);
+    if ($socket === false) {
+        return false;
     }
+    fclose($socket);
+    return true;
+}
+
+function probe_udp_connect(string $ip, int $port, int $timeoutMs): bool
+{
+    $timeoutSeconds = max(0.2, $timeoutMs / 1000);
+    $errno = 0;
+    $errstr = '';
+    $socket = @stream_socket_client(
+        sprintf('udp://%s:%d', $ip, $port),
+        $errno,
+        $errstr,
+        $timeoutSeconds,
+        STREAM_CLIENT_CONNECT
+    );
+    if ($socket === false) {
+        return false;
+    }
+
+    stream_set_timeout($socket, 0, $timeoutMs * 1000);
+    @fwrite($socket, "\x00");
+    fclose($socket);
+    return true;
+}
+
+function finalize_ping_result(string $ip, array $result): array
+{
+    $hostname = null;
+    if (($result['status'] ?? 'ERROR') === 'OK') {
+        $hostname = reverse_dns_lookup($ip);
+    }
+
+    $result['hostname'] = $hostname;
+    return $result;
+}
+
+function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
+{
+    $timeoutMs = clamp_int($timeoutMs, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $icmpResult = run_icmp_ping($ip, $timeoutMs);
+    if ($icmpResult['status'] === 'OK') {
+        return finalize_ping_result($ip, $icmpResult);
+    }
+
+    if (probe_tcp_connect($ip, TCP_FALLBACK_PORT, $timeoutMs)) {
+        return finalize_ping_result($ip, [
+            'status' => 'OK',
+            'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('TCP fallback OK (%s:%d)', $ip, TCP_FALLBACK_PORT)),
+            'latency_ms' => null,
+            'method' => 'TCP',
+        ]);
+    }
+
+    if (probe_udp_connect($ip, UDP_FALLBACK_PORT, $timeoutMs)) {
+        return finalize_ping_result($ip, [
+            'status' => 'OK',
+            'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('UDP fallback OK (%s:%d)', $ip, UDP_FALLBACK_PORT)),
+            'latency_ms' => null,
+            'method' => 'UDP',
+        ]);
+    }
+
+    return finalize_ping_result($ip, $icmpResult);
+}
+
+function start_async_icmp_ping(string $ip, int $timeoutMs)
+{
+    $command = build_icmp_ping_command($ip, $timeoutMs);
+    $descriptorSpec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $process = @proc_open($command, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        return null;
+    }
+
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    return [
+        'process' => $process,
+        'stdout' => $pipes[1],
+        'stderr' => $pipes[2],
+        'buffer' => '',
+        'ip' => $ip,
+    ];
+}
+
+function finish_async_icmp_ping(array $task): array
+{
+    $stdout = stream_get_contents($task['stdout']) ?: '';
+    $stderr = stream_get_contents($task['stderr']) ?: '';
+    fclose($task['stdout']);
+    fclose($task['stderr']);
+
+    $exitCode = proc_close($task['process']);
+    $output = trim($task['buffer'] . $stdout . $stderr);
 
     return [
         'status' => $exitCode === 0 ? 'OK' : 'ERROR',
-        'hostname' => $hostname,
         'output' => $output,
+        'latency_ms' => parse_rtt_ms_from_output($output),
+        'method' => 'ICMP',
     ];
+}
+
+function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
+{
+    $poolSize = max(1, $poolSize);
+    $queue = array_values($ips);
+    $running = [];
+    $results = [];
+    $rttSamples = [];
+
+    while ($queue !== [] || $running !== []) {
+        $sampleAvg = $rttSamples === []
+            ? DEFAULT_SCAN_TIMEOUT_MS / 3
+            : array_sum($rttSamples) / count($rttSamples);
+        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+
+        while ($queue !== [] && count($running) < $poolSize) {
+            $ip = array_shift($queue);
+            $task = start_async_icmp_ping($ip, $dynamicTimeoutMs);
+            if ($task === null) {
+                $results[$ip] = ping_ip($ip, $dynamicTimeoutMs);
+                continue;
+            }
+            $running[$ip] = $task;
+        }
+
+        foreach ($running as $ip => &$task) {
+            $task['buffer'] .= stream_get_contents($task['stdout']) ?: '';
+            $task['buffer'] .= stream_get_contents($task['stderr']) ?: '';
+            $status = proc_get_status($task['process']);
+            if ($status['running']) {
+                continue;
+            }
+
+            $icmpResult = finish_async_icmp_ping($task);
+            if ($icmpResult['status'] === 'OK') {
+                if ($icmpResult['latency_ms'] !== null) {
+                    $rttSamples[] = $icmpResult['latency_ms'];
+                    if (count($rttSamples) > 32) {
+                        array_shift($rttSamples);
+                    }
+                }
+                $results[$ip] = finalize_ping_result($ip, $icmpResult);
+            } else {
+                $results[$ip] = ping_ip($ip, $dynamicTimeoutMs);
+            }
+
+            unset($running[$ip]);
+        }
+        unset($task);
+
+        if ($running !== []) {
+            usleep(20000);
+        }
+    }
+
+    return $results;
 }
 
 function run_ping_for_ip(string $ip): void
@@ -393,7 +609,7 @@ function run_ping_for_ip(string $ip): void
             last_seen_online_at = COALESCE(:last_seen_online_at, last_seen_online_at),
             next_auto_ping_at = :next_auto_ping_at,
             last_uptime = COALESCE(:last_uptime, last_uptime),
-            host_name = COALESCE(NULLIF(host_name, ""), :host_name)
+            host_name = COALESCE(NULLIF(:host_name, ""), host_name)
         WHERE ip_address = :ip_address');
     $update->execute([
         'last_ping_at' => $timestamp,
@@ -460,7 +676,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
                     THEN COALESCE(NULLIF(:alias, ""), alias)
                 ELSE alias
             END,
-            host_name = COALESCE(NULLIF(host_name, ""), :host_name)
+            host_name = COALESCE(NULLIF(:host_name, ""), host_name)
             WHERE ip_address = :ip_address');
         $update->execute([
             'last_ping_at' => $timestamp,
@@ -570,14 +786,19 @@ function run_segment_scan(string $prefix, string $createdBy): array
     $existingInSegment = count_ips_in_prefix($prefix);
     $seedOfflineAsFree = $existingInSegment === 0;
 
+    $ips = [];
     for ($host = 1; $host <= 254; $host++) {
-        $ip = $prefix . '.' . $host;
-        $result = ping_ip($ip);
+        $ips[] = $prefix . '.' . $host;
+    }
+
+    $scanResults = scan_ips_parallel($ips, SCAN_POOL_SIZE);
+    usort($ips, static fn(string $a, string $b): int => ip_sort_value($a) <=> ip_sort_value($b));
+
+    foreach ($ips as $ip) {
+        $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
         if ($result['status'] !== 'OK') {
-            if ($seedOfflineAsFree) {
-                if (insert_free_placeholder_ip($ip, $createdBy)) {
-                    $markedFree++;
-                }
+            if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
+                $markedFree++;
             }
             continue;
         }
@@ -949,11 +1170,41 @@ if ($action === 'reset_user_password') {
 
 if ($action === 'ping_now') {
     $ip = trim((string) ($_POST['ip_address'] ?? ''));
-    if (validate_ip($ip)) {
-        run_ping_for_ip($ip);
-        flash('Ping ejecutado para ' . $ip . '.', 'success');
+    $returnTo = safe_redirect_target((string) ($_POST['return_to'] ?? ''), 'index.php?view=ips');
+
+    if (!validate_ip($ip)) {
+        if (is_json_request()) {
+            json_response([
+                'ok' => false,
+                'message' => 'IP inválida.',
+            ], 422);
+        }
+        flash('IP inválida.', 'error');
+        redirect($returnTo);
     }
-    redirect('index.php?view=ips');
+
+    run_ping_for_ip($ip);
+
+    $rowStmt = db()->prepare('SELECT ip_address, host_name, last_status, last_ping_at FROM ip_registry WHERE ip_address = :ip_address');
+    $rowStmt->execute(['ip_address' => $ip]);
+    $row = $rowStmt->fetch() ?: [];
+
+    if (is_json_request()) {
+        $status = strtoupper((string) ($row['last_status'] ?? 'SIN DATOS'));
+        json_response([
+            'ok' => true,
+            'message' => 'Ping ejecutado para ' . $ip . '.',
+            'ip' => $ip,
+            'status' => $status,
+            'status_class' => $status === 'OK' ? 'ok' : ($status === 'ERROR' ? 'error' : 'unknown'),
+            'hostname' => (string) ($row['host_name'] ?? ''),
+            'last_ping_at' => (string) ($row['last_ping_at'] ?? ''),
+            'last_ping_at_display' => format_display_datetime((string) ($row['last_ping_at'] ?? '')),
+        ]);
+    }
+
+    flash('Ping ejecutado para ' . $ip . '.', 'success');
+    redirect($returnTo);
 }
 
 if ($action === 'ping_all') {
@@ -1307,15 +1558,15 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                         <tr><td colspan="5">No hay IPs registradas.</td></tr>
                     <?php else: ?>
                         <?php foreach ($rows as $row): ?>
-                            <tr>
+                            <tr data-ip-row="<?= h($row['ip_address']) ?>">
                                 <td>
                                     <strong><?= h($row['ip_address']) ?></strong>
-                                    <div class="muted"><?= h($row['host_name'] ?: '-') ?></div>
+                                    <div class="muted js-hostname"><?= h($row['host_name'] ?: '-') ?></div>
                                 </td>
                                 <td><?= h($row['location'] ?: '-') ?></td>
                                 <td>
                                     Alias: <?= h($row['alias'] ?: '-') ?><br>
-                                    Nombre: <?= h($row['host_name'] ?: '-') ?><br>
+                                    Nombre: <span class="js-hostname"><?= h($row['host_name'] ?: '-') ?></span><br>
                                 Tipo: <?= h($row['host_type'] ?: '-') ?><br>
                                 Ubicación: <?= h($row['location'] ?: '-') ?><br>
                                 Notas: <?= h($row['notes'] ?: '-') ?><br>
@@ -1323,17 +1574,18 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                 Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
                                 Registrado por: <?= h($row['created_by'] ?: '-') ?>
                             </td>
-                                <td>
+                                <td class="js-status-cell">
                                     <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
-                                    <span class="status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
-                                    <div class="muted"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
+                                    <span class="status-pill js-status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
+                                    <div class="muted js-last-ping"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
                                 </td>
                                 <td class="actions-col">
                                     <a class="btn small" href="index.php?view=ips&amp;action=detail&amp;ip=<?= urlencode($row['ip_address']) ?>">Detalles</a>
-                                    <form method="post">
+                                    <form method="post" class="js-ping-now-form">
                                         <input type="hidden" name="action" value="ping_now">
                                         <input type="hidden" name="ip_address" value="<?= h($row['ip_address']) ?>">
-                                        <button class="btn small">Ping</button>
+                                        <input type="hidden" name="return_to" value="<?= h($currentUrl) ?>">
+                                        <button class="btn small js-ping-btn" type="submit">Ping</button>
                                     </form>
                                 </td>
                             </tr>
@@ -1508,5 +1760,73 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         </div>
     <?php endif; ?>
 </main>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const forms = document.querySelectorAll('.js-ping-now-form');
+    forms.forEach((form) => {
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+
+            const btn = form.querySelector('.js-ping-btn');
+            if (!btn) {
+                form.submit();
+                return;
+            }
+
+            const originalLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Ping...';
+
+            try {
+                const response = await fetch('index.php', {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                    body: new FormData(form),
+                });
+
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+
+                const data = await response.json();
+                if (!data.ok) {
+                    throw new Error(data.message || 'No se pudo ejecutar ping');
+                }
+
+                const row = form.closest('tr[data-ip-row]');
+                if (!row) {
+                    return;
+                }
+
+                row.querySelectorAll('.js-hostname').forEach((node) => {
+                    node.textContent = data.hostname && data.hostname.trim() !== '' ? data.hostname : '-';
+                });
+
+                const statusPill = row.querySelector('.js-status-pill');
+                if (statusPill) {
+                    statusPill.textContent = data.status || 'SIN DATOS';
+                    statusPill.classList.remove('ok', 'error', 'unknown');
+                    statusPill.classList.add(data.status_class || 'unknown');
+                }
+
+                const lastPing = row.querySelector('.js-last-ping');
+                if (lastPing) {
+                    lastPing.textContent = data.last_ping_at_display || 'Nunca';
+                }
+            } catch (error) {
+                form.submit();
+                return;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalLabel;
+            }
+        });
+    });
+});
+</script>
 </body>
 </html>
