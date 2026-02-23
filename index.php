@@ -1273,6 +1273,18 @@ $segmentFilter = normalize_segment_filter($segmentFilterInput);
 $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
 $nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
 $locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
+$statusFilterInput = strtolower(trim((string) ($_GET['status_filter'] ?? 'all')));
+$allowedStatusFilters = ['all', 'ok', 'error', 'unknown'];
+if (!in_array($statusFilterInput, $allowedStatusFilters, true)) {
+    $statusFilterInput = 'all';
+}
+
+$perPageOptions = [10, 20, 30, 40, 50, 100, 150, 200, 250];
+$perPageInput = (int) ($_GET['per_page'] ?? 50);
+if (!in_array($perPageInput, $perPageOptions, true)) {
+    $perPageInput = 50;
+}
+$pageInput = max(1, (int) ($_GET['page'] ?? 1));
 
 $sql = 'SELECT * FROM ip_registry';
 $params = [];
@@ -1305,6 +1317,16 @@ if ($locationFilterInput !== '') {
     $params['location_filter'] = '%' . $locationFilterInput . '%';
 }
 
+$conditionsWithoutStatus = $conditions;
+
+if ($statusFilterInput === 'ok') {
+    $conditions[] = 'UPPER(COALESCE(last_status, "")) = "OK"';
+} elseif ($statusFilterInput === 'error') {
+    $conditions[] = 'UPPER(COALESCE(last_status, "")) = "ERROR"';
+} elseif ($statusFilterInput === 'unknown') {
+    $conditions[] = '(last_status IS NULL OR TRIM(last_status) = "" OR (UPPER(last_status) <> "OK" AND UPPER(last_status) <> "ERROR"))';
+}
+
 if ($conditions) {
     $sql .= ' WHERE ' . implode(' AND ', $conditions);
 }
@@ -1313,6 +1335,33 @@ $stmt = db()->prepare($sql);
 $stmt->execute($params);
 $rows = $stmt->fetchAll();
 usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
+
+$totalRows = count($rows);
+$totalPages = max(1, (int) ceil($totalRows / $perPageInput));
+$currentPage = min($pageInput, $totalPages);
+$offset = ($currentPage - 1) * $perPageInput;
+$rows = array_slice($rows, $offset, $perPageInput);
+
+$baseQueryParams = [
+    'view' => 'ips',
+    'segment' => $segmentFilterInput,
+    'ip_filter' => $ipFilterInput,
+    'name_filter' => $nameFilterInput,
+    'location_filter' => $locationFilterInput,
+    'status_filter' => $statusFilterInput,
+    'per_page' => (string) $perPageInput,
+];
+$statusCountsSql = 'SELECT
+    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "OK" THEN 1 ELSE 0 END) AS ok_count,
+    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "ERROR" THEN 1 ELSE 0 END) AS error_count,
+    SUM(CASE WHEN last_status IS NULL OR TRIM(last_status) = "" OR (UPPER(last_status) <> "OK" AND UPPER(last_status) <> "ERROR") THEN 1 ELSE 0 END) AS unknown_count
+    FROM ip_registry';
+if ($conditionsWithoutStatus !== []) {
+    $statusCountsSql .= ' WHERE ' . implode(' AND ', $conditionsWithoutStatus);
+}
+$statusCountsStmt = db()->prepare($statusCountsSql);
+$statusCountsStmt->execute($params);
+$statusCounts = $statusCountsStmt->fetch() ?: ['ok_count' => 0, 'error_count' => 0, 'unknown_count' => 0];
 
 foreach ($rows as &$row) {
     $row['segment'] = compute_segment($row['ip_address']);
@@ -1593,6 +1642,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             <summary><h2>Buscar y filtrar</h2></summary>
             <form method="get" class="form-grid four">
                 <input type="hidden" name="view" value="ips" />
+                <input type="hidden" name="page" value="1" />
                 <label>Segmento (/24 o solo rango)
                     <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
                 </label>
@@ -1605,6 +1655,21 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <label>Ubicación
                     <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
                 </label>
+                <label>Estado
+                    <select name="status_filter">
+                        <option value="all" <?= $statusFilterInput === 'all' ? 'selected' : '' ?>>Todos</option>
+                        <option value="ok" <?= $statusFilterInput === 'ok' ? 'selected' : '' ?>>OK</option>
+                        <option value="error" <?= $statusFilterInput === 'error' ? 'selected' : '' ?>>ERROR</option>
+                        <option value="unknown" <?= $statusFilterInput === 'unknown' ? 'selected' : '' ?>>Sin datos</option>
+                    </select>
+                </label>
+                <label>Filas por página
+                    <select name="per_page">
+                        <?php foreach ($perPageOptions as $opt): ?>
+                            <option value="<?= h((string) $opt) ?>" <?= $perPageInput === $opt ? 'selected' : '' ?>><?= h((string) $opt) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
                 <div class="form-end">
                     <button type="submit" class="btn small">Aplicar</button>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
@@ -1616,6 +1681,22 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             <div class="card-title-row">
                 <h2>IPs registradas</h2>
                 <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
+            </div>
+            <div class="top-actions" style="margin-bottom:10px; gap:8px;">
+                <?php
+                $statusButtons = [
+                    'all' => ['label' => 'Todos', 'count' => (int) $totalRows],
+                    'ok' => ['label' => 'OK', 'count' => (int) ($statusCounts['ok_count'] ?? 0)],
+                    'error' => ['label' => 'ERROR', 'count' => (int) ($statusCounts['error_count'] ?? 0)],
+                    'unknown' => ['label' => 'Sin datos', 'count' => (int) ($statusCounts['unknown_count'] ?? 0)],
+                ];
+                ?>
+                <?php foreach ($statusButtons as $statusKey => $meta): ?>
+                    <?php $query = $baseQueryParams; $query['status_filter'] = $statusKey; $query['page'] = '1'; ?>
+                    <a class="btn small <?= $statusFilterInput === $statusKey ? 'primary' : '' ?>" href="index.php?<?= h(http_build_query($query)) ?>">
+                        <?= h($meta['label']) ?> (<?= h((string) $meta['count']) ?>)
+                    </a>
+                <?php endforeach; ?>
             </div>
             <div class="table-wrap">
                 <table>
@@ -1668,6 +1749,20 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <?php endif; ?>
                     </tbody>
                 </table>
+            </div>
+            <div class="card-title-row" style="margin-top:10px;">
+                <?php
+                $startRow = $totalRows === 0 ? 0 : ($offset + 1);
+                $endRow = min($offset + $perPageInput, $totalRows);
+                ?>
+                <div class="muted">Mostrando <?= h((string) $startRow) ?> a <?= h((string) $endRow) ?> de <?= h((string) $totalRows) ?> filas</div>
+                <div class="top-actions" style="gap:8px;">
+                    <?php $prevQuery = $baseQueryParams; $prevQuery['page'] = (string) max(1, $currentPage - 1); ?>
+                    <?php $nextQuery = $baseQueryParams; $nextQuery['page'] = (string) min($totalPages, $currentPage + 1); ?>
+                    <a class="btn small <?= $currentPage <= 1 ? 'ghost' : '' ?>" href="index.php?<?= h(http_build_query($prevQuery)) ?>">Anterior</a>
+                    <span class="pill">Página <?= h((string) $currentPage) ?> / <?= h((string) $totalPages) ?></span>
+                    <a class="btn small <?= $currentPage >= $totalPages ? 'ghost' : '' ?>" href="index.php?<?= h(http_build_query($nextQuery)) ?>">Siguiente</a>
+                </div>
             </div>
         </section>
 
