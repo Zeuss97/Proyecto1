@@ -16,7 +16,6 @@ const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
 const DEFAULT_SCAN_TIMEOUT_MS = 1000;
 const TCP_FALLBACK_PORT = 80;
-const UDP_FALLBACK_PORT = 33434;
 
 session_start();
 
@@ -433,28 +432,6 @@ function probe_tcp_connect(string $ip, int $port, int $timeoutMs): bool
     return true;
 }
 
-function probe_udp_connect(string $ip, int $port, int $timeoutMs): bool
-{
-    $timeoutSeconds = max(0.2, $timeoutMs / 1000);
-    $errno = 0;
-    $errstr = '';
-    $socket = @stream_socket_client(
-        sprintf('udp://%s:%d', $ip, $port),
-        $errno,
-        $errstr,
-        $timeoutSeconds,
-        STREAM_CLIENT_CONNECT
-    );
-    if ($socket === false) {
-        return false;
-    }
-
-    stream_set_timeout($socket, 0, $timeoutMs * 1000);
-    @fwrite($socket, "\x00");
-    fclose($socket);
-    return true;
-}
-
 function finalize_ping_result(string $ip, array $result): array
 {
     $hostname = null;
@@ -480,15 +457,6 @@ function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
             'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('TCP fallback OK (%s:%d)', $ip, TCP_FALLBACK_PORT)),
             'latency_ms' => null,
             'method' => 'TCP',
-        ]);
-    }
-
-    if (probe_udp_connect($ip, UDP_FALLBACK_PORT, $timeoutMs)) {
-        return finalize_ping_result($ip, [
-            'status' => 'OK',
-            'output' => trim(($icmpResult['output'] ?? '') . PHP_EOL . sprintf('UDP fallback OK (%s:%d)', $ip, UDP_FALLBACK_PORT)),
-            'latency_ms' => null,
-            'method' => 'UDP',
         ]);
     }
 
