@@ -11,12 +11,15 @@ const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
-const SCAN_POOL_SIZE = 48;
+const SCAN_POOL_SIZE_KEY = 'scan_pool_size';
+const SCAN_DEFAULT_TIMEOUT_MS_KEY = 'scan_default_timeout_ms';
+const SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY = 'scan_segment_timeout_max_ms';
+const SCAN_POOL_SIZE_DEFAULT = 100;
 const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
-const DEFAULT_SCAN_TIMEOUT_MS = 1000;
+const DEFAULT_SCAN_TIMEOUT_MS = 2000;
 const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
-const SEGMENT_SCAN_TIMEOUT_MAX_MS = 850;
+const SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT = 2000;
 const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
 const TCP_FALLBACK_PORT = 80;
 
@@ -174,6 +177,31 @@ function set_app_setting(string $key, string $value): void
         'setting_key' => $key,
         'setting_value' => $value,
     ]);
+}
+
+function get_app_setting_int(string $key, int $default, int $min, int $max): int
+{
+    $raw = trim(get_app_setting($key, (string) $default));
+    if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) {
+        return clamp_int($default, $min, $max);
+    }
+
+    return clamp_int((int) $raw, $min, $max);
+}
+
+function get_scan_pool_size(): int
+{
+    return get_app_setting_int(SCAN_POOL_SIZE_KEY, SCAN_POOL_SIZE_DEFAULT, 1, 256);
+}
+
+function get_scan_default_timeout_ms(): int
+{
+    return get_app_setting_int(SCAN_DEFAULT_TIMEOUT_MS_KEY, DEFAULT_SCAN_TIMEOUT_MS, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+function get_scan_segment_timeout_max_ms(): int
+{
+    return get_app_setting_int(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT, SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
 }
 
 function current_user(): ?array
@@ -460,6 +488,18 @@ function apply_tcp_fallback(string $ip, array $icmpResult, int $timeoutMs): arra
     return finalize_ping_result($ip, $icmpResult);
 }
 
+function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
+{
+    $timeoutMs = clamp_int($timeoutMs, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $icmpResult = run_icmp_ping($ip, $timeoutMs);
+
+    if ($icmpResult['status'] === 'OK') {
+        return finalize_ping_result($ip, $icmpResult);
+    }
+
+    return apply_tcp_fallback($ip, $icmpResult, $timeoutMs);
+}
+
 function start_async_icmp_ping(string $ip, int $timeoutMs)
 {
     $command = build_icmp_ping_command($ip, $timeoutMs);
@@ -505,9 +545,9 @@ function finish_async_icmp_ping(array $task): array
     ];
 }
 
-function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
+function scan_ips_parallel(array $ips, int $poolSize): array
 {
-    $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE);
+    $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE_DEFAULT);
     $queue = array_values($ips);
     $running = [];
     $results = [];
@@ -543,9 +583,9 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
         }
 
         $sampleAvg = $rttSamples === []
-            ? DEFAULT_SCAN_TIMEOUT_MS / 3
+            ? get_scan_default_timeout_ms() / 3
             : array_sum($rttSamples) / count($rttSamples);
-        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, SEGMENT_SCAN_TIMEOUT_MAX_MS);
+        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, get_scan_segment_timeout_max_ms());
 
         while ($queue !== [] && count($running) < $poolSize) {
             $ip = array_shift($queue);
@@ -583,7 +623,7 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
         unset($task);
 
         if ($running !== []) {
-            usleep(10000);
+            usleep(5000);
         }
     }
 
@@ -592,7 +632,7 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
 
 function run_ping_for_ip(string $ip): void
 {
-    $result = ping_ip($ip);
+    $result = ping_ip($ip, get_scan_default_timeout_ms());
     $uptime = probe_uptime($ip);
     $timestamp = now_iso();
     $lastSeenOnlineAt = $result['status'] === 'OK' ? $timestamp : null;
@@ -784,7 +824,7 @@ function run_segment_scan(string $prefix, string $createdBy): array
         $ips[] = $prefix . '.' . $host;
     }
 
-    $scanResults = scan_ips_parallel($ips, SCAN_POOL_SIZE);
+    $scanResults = scan_ips_parallel($ips, get_scan_pool_size());
     usort($ips, static fn(string $a, string $b): int => ip_sort_value($a) <=> ip_sort_value($b));
 
     foreach ($ips as $ip) {
@@ -977,6 +1017,24 @@ if ($action === 'toggle_theme') {
     $_SESSION['theme'] = (($_SESSION['theme'] ?? 'light') === 'light') ? 'dark' : 'light';
     $redirectTo = safe_redirect_target($_POST['redirect_to'] ?? null, 'index.php');
     redirect($redirectTo);
+}
+
+if ($action === 'save_scan_profile') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede modificar el perfil de escaneo.', 'error');
+        redirect('index.php');
+    }
+
+    $poolSize = clamp_int((int) ($_POST['scan_pool_size'] ?? SCAN_POOL_SIZE_DEFAULT), 1, 256);
+    $defaultTimeout = clamp_int((int) ($_POST['scan_default_timeout_ms'] ?? DEFAULT_SCAN_TIMEOUT_MS), SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $segmentTimeoutMax = clamp_int((int) ($_POST['scan_segment_timeout_max_ms'] ?? SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT), SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+
+    set_app_setting(SCAN_POOL_SIZE_KEY, (string) $poolSize);
+    set_app_setting(SCAN_DEFAULT_TIMEOUT_MS_KEY, (string) $defaultTimeout);
+    set_app_setting(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, (string) $segmentTimeoutMax);
+
+    flash('Perfil de escaneo actualizado.', 'success');
+    redirect('index.php');
 }
 
 if ($action === 'add_ip') {
@@ -1324,6 +1382,11 @@ if (($action === 'detail' || isset($_GET['ip'])) && validate_ip($detailIp)) {
 $flash = flash();
 $wallpapers = list_wallpapers();
 $selectedWallpaper = get_app_setting('login_wallpaper', '');
+$scanProfile = [
+    'pool_size' => get_scan_pool_size(),
+    'default_timeout_ms' => get_scan_default_timeout_ms(),
+    'segment_timeout_max_ms' => get_scan_segment_timeout_max_ms(),
+];
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -1385,6 +1448,25 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                 </form>
                             </div>
                         </div>
+
+                        <details class="menu-item flyout-parent">
+                            <summary class="menu-item-title">Escaneo</summary>
+                            <div class="flyout-menu">
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="save_scan_profile" />
+                                    <label>Hilos máximos
+                                        <input type="number" min="1" max="256" name="scan_pool_size" value="<?= h((string) $scanProfile['pool_size']) ?>">
+                                    </label>
+                                    <label>Timeout ping por defecto (ms)
+                                        <input type="number" min="<?= h((string) SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_default_timeout_ms" value="<?= h((string) $scanProfile['default_timeout_ms']) ?>">
+                                    </label>
+                                    <label>Timeout máximo escaneo segmento (ms)
+                                        <input type="number" min="<?= h((string) SEGMENT_SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_segment_timeout_max_ms" value="<?= h((string) $scanProfile['segment_timeout_max_ms']) ?>">
+                                    </label>
+                                    <button type="submit" class="btn small">Guardar</button>
+                                </form>
+                            </div>
+                        </details>
 
                         <details class="menu-item flyout-parent">
                             <summary class="menu-item-title">Usuario</summary>
