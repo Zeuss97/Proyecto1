@@ -621,7 +621,7 @@ function finish_async_icmp_ping(array $task): array
     ];
 }
 
-function scan_ips_parallel(array $ips, int $poolSize): array
+function scan_ips_parallel(array $ips, int $poolSize, ?callable $onResult = null): array
 {
     $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE_DEFAULT);
     $queue = array_values($ips);
@@ -629,6 +629,9 @@ function scan_ips_parallel(array $ips, int $poolSize): array
     $results = [];
     $rttSamples = [];
     $startedAt = microtime(true);
+
+    $processed = 0;
+    $total = count($queue);
 
     while ($queue !== [] || $running !== []) {
         $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
@@ -645,6 +648,10 @@ function scan_ips_parallel(array $ips, int $poolSize): array
                     'method' => 'ICMP',
                     'hostname' => null,
                 ];
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
             }
             foreach ($queue as $ip) {
                 $results[$ip] = [
@@ -654,6 +661,10 @@ function scan_ips_parallel(array $ips, int $poolSize): array
                     'method' => 'ICMP',
                     'hostname' => null,
                 ];
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
             }
             break;
         }
@@ -668,6 +679,10 @@ function scan_ips_parallel(array $ips, int $poolSize): array
             $task = start_async_icmp_ping($ip, $dynamicTimeoutMs);
             if ($task === null) {
                 $results[$ip] = ping_ip($ip, $dynamicTimeoutMs);
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
                 continue;
             }
             $running[$ip] = $task;
@@ -692,6 +707,11 @@ function scan_ips_parallel(array $ips, int $poolSize): array
                 $results[$ip] = finalize_ping_result($ip, $icmpResult);
             } else {
                 $results[$ip] = apply_tcp_fallback($ip, $icmpResult, $dynamicTimeoutMs);
+            }
+
+            $processed++;
+            if (is_callable($onResult)) {
+                $onResult($ip, $results[$ip], $processed, $total);
             }
 
             unset($running[$ip]);
@@ -901,37 +921,29 @@ function run_segment_scan(string $prefix, string $createdBy, ?callable $onProgre
     }
 
     usort($ips, static fn(string $a, string $b): int => ip_sort_value($a) <=> ip_sort_value($b));
-    $total = count($ips);
-    $processed = 0;
-
-    foreach (array_chunk($ips, 32) as $chunk) {
-        $scanResults = scan_ips_parallel($chunk, get_scan_pool_size());
-        foreach ($chunk as $ip) {
-            $processed++;
-            $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
-            if ($result['status'] !== 'OK') {
-                if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
-                    $markedFree++;
-                }
-                if (is_callable($onProgress)) {
-                    $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
-                }
-                continue;
+    scan_ips_parallel($ips, get_scan_pool_size(), static function (string $ip, array $result, int $processed, int $total) use (&$foundOnline, &$inserted, &$updated, &$markedFree, $seedOfflineAsFree, $createdBy, $onProgress): void {
+        if (($result['status'] ?? 'ERROR') !== 'OK') {
+            if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
+                $markedFree++;
             }
-
-            $foundOnline++;
-            $state = upsert_scanned_ip($ip, $result, $createdBy);
-            if ($state === 'inserted') {
-                $inserted++;
-            } else {
-                $updated++;
-            }
-
             if (is_callable($onProgress)) {
                 $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
             }
+            return;
         }
-    }
+
+        $foundOnline++;
+        $state = upsert_scanned_ip($ip, $result, $createdBy);
+        if ($state === 'inserted') {
+            $inserted++;
+        } else {
+            $updated++;
+        }
+
+        if (is_callable($onProgress)) {
+            $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
+        }
+    });
 
     return [
         'found_online' => $foundOnline,
