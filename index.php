@@ -6,19 +6,26 @@ const DB_DIR = __DIR__ . '/data';
 const DB_PATH = DB_DIR . '/ips.db';
 const ROLE_ADMIN = 'admin';
 const ROLE_OPERATOR = 'operator';
-const HOST_TYPES = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
+const HOST_TYPES_DEFAULT = ['NOTEBOOK', 'DESKTOP', 'SERVER', 'IMPRESORA', 'ROUTER', 'OTRO'];
+const HOST_TYPES_KEY = 'host_types';
 const DISPLAY_TZ = '-03:00';
 const AUTO_SCAN_TARGET_HOUR = 13;
 const AUTO_SCAN_LAST_RUN_KEY = 'auto_scan_last_run_at';
 const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
-const SCAN_POOL_SIZE = 48;
+const SCAN_POOL_SIZE_KEY = 'scan_pool_size';
+const SCAN_DEFAULT_TIMEOUT_MS_KEY = 'scan_default_timeout_ms';
+const SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY = 'scan_segment_timeout_max_ms';
+const SCAN_POOL_SIZE_DEFAULT = 100;
 const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
-const DEFAULT_SCAN_TIMEOUT_MS = 1000;
+const DEFAULT_SCAN_TIMEOUT_MS = 2000;
+const MANUAL_PING_TIMEOUT_MAX_MS = 900;
 const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
-const SEGMENT_SCAN_TIMEOUT_MAX_MS = 850;
+const SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT = 2000;
 const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
 const TCP_FALLBACK_PORT = 80;
+const PING_ALL_BATCH_SIZE = 24;
+const PING_ALL_POOL_SIZE_MAX = 64;
 
 session_start();
 
@@ -131,6 +138,9 @@ function init_db(): void
     if (!in_array('next_auto_ping_at', $columnNames, true)) {
         $pdo->exec('ALTER TABLE ip_registry ADD COLUMN next_auto_ping_at TEXT');
     }
+    if (!in_array('ip_sort_int', $columnNames, true)) {
+        $pdo->exec('ALTER TABLE ip_registry ADD COLUMN ip_sort_int INTEGER');
+    }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ping_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +150,38 @@ function init_db(): void
         output TEXT,
         pinged_at TEXT NOT NULL
     )');
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS background_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        message TEXT,
+        created_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        result_json TEXT
+    )');
+
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_last_status ON ip_registry(last_status)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_location ON ip_registry(location)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_alias ON ip_registry(alias)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_host_name ON ip_registry(host_name)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_next_ping ON ip_registry(next_auto_ping_at)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_ip_sort_int ON ip_registry(ip_sort_int, ip_address)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ping_logs_ip_pinged_at ON ping_logs(ip_address, pinged_at DESC)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_background_jobs_status_updated ON background_jobs(status, updated_at)');
+
+    $pdo->exec('UPDATE ip_registry
+        SET ip_sort_int = (
+            CAST(substr(ip_address, 1, instr(ip_address, '.') - 1) AS INTEGER) * 16777216 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + 1), '.') - 1) AS INTEGER) * 65536 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') - 1) AS INTEGER) * 256 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') + 1) AS INTEGER)
+        )
+        WHERE ip_sort_int IS NULL AND ip_address LIKE "%.%.%.%"');
 
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
@@ -174,6 +216,89 @@ function set_app_setting(string $key, string $value): void
         'setting_key' => $key,
         'setting_value' => $value,
     ]);
+}
+
+function get_app_setting_int(string $key, int $default, int $min, int $max): int
+{
+    $raw = trim(get_app_setting($key, (string) $default));
+    if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) {
+        return clamp_int($default, $min, $max);
+    }
+
+    return clamp_int((int) $raw, $min, $max);
+}
+
+function get_scan_pool_size(): int
+{
+    return get_app_setting_int(SCAN_POOL_SIZE_KEY, SCAN_POOL_SIZE_DEFAULT, 1, 256);
+}
+
+function get_scan_default_timeout_ms(): int
+{
+    return get_app_setting_int(SCAN_DEFAULT_TIMEOUT_MS_KEY, DEFAULT_SCAN_TIMEOUT_MS, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+function get_manual_ping_timeout_ms(): int
+{
+    return clamp_int(get_scan_default_timeout_ms(), SCAN_TIMEOUT_MIN_MS, MANUAL_PING_TIMEOUT_MAX_MS);
+}
+
+function get_scan_segment_timeout_max_ms(): int
+{
+    return get_app_setting_int(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT, SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+
+function normalize_host_type_label(string $value): string
+{
+    return strtoupper(trim($value));
+}
+
+function get_host_types(): array
+{
+    $raw = trim(get_app_setting(HOST_TYPES_KEY, ''));
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $normalized = [];
+            foreach ($decoded as $item) {
+                if (!is_string($item)) {
+                    continue;
+                }
+                $label = normalize_host_type_label($item);
+                if ($label === '') {
+                    continue;
+                }
+                $normalized[$label] = $label;
+            }
+            if ($normalized !== []) {
+                return array_values($normalized);
+            }
+        }
+    }
+
+    return HOST_TYPES_DEFAULT;
+}
+
+function save_host_types(array $types): void
+{
+    $normalized = [];
+    foreach ($types as $type) {
+        if (!is_string($type)) {
+            continue;
+        }
+        $label = normalize_host_type_label($type);
+        if ($label === '') {
+            continue;
+        }
+        $normalized[$label] = $label;
+    }
+
+    if ($normalized === []) {
+        $normalized = array_combine(HOST_TYPES_DEFAULT, HOST_TYPES_DEFAULT) ?: [];
+    }
+
+    set_app_setting(HOST_TYPES_KEY, json_encode(array_values($normalized), JSON_UNESCAPED_UNICODE));
 }
 
 function current_user(): ?array
@@ -255,6 +380,31 @@ function ip_sort_value(string $ip): int
         }
     }
     return PHP_INT_MAX;
+}
+
+function present_status_label(string $status): string
+{
+    $normalized = strtoupper(trim($status));
+    if ($normalized === 'ERROR') {
+        return 'LIBRE';
+    }
+    if ($normalized === '') {
+        return 'SIN DATOS';
+    }
+
+    return $normalized;
+}
+
+function ipv4_sort_sql_expr(string $field = 'ip_address'): string
+{
+    $octet1 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $field);
+    $rest1 = sprintf('substr(%1$s, instr(%1$s, ".") + 1)', $field);
+    $octet2 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $rest1);
+    $rest2 = sprintf('substr(%1$s, instr(%1$s, ".") + 1)', $rest1);
+    $octet3 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $rest2);
+    $octet4 = sprintf('CAST(substr(%1$s, instr(%1$s, ".") + 1) AS INTEGER)', $rest2);
+
+    return '(' . $octet1 . ' * 16777216 + ' . $octet2 . ' * 65536 + ' . $octet3 . ' * 256 + ' . $octet4 . ')';
 }
 
 function normalize_segment_filter(string $input): ?string
@@ -460,6 +610,18 @@ function apply_tcp_fallback(string $ip, array $icmpResult, int $timeoutMs): arra
     return finalize_ping_result($ip, $icmpResult);
 }
 
+function ping_ip(string $ip, int $timeoutMs = DEFAULT_SCAN_TIMEOUT_MS): array
+{
+    $timeoutMs = clamp_int($timeoutMs, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $icmpResult = run_icmp_ping($ip, $timeoutMs);
+
+    if ($icmpResult['status'] === 'OK') {
+        return finalize_ping_result($ip, $icmpResult);
+    }
+
+    return apply_tcp_fallback($ip, $icmpResult, $timeoutMs);
+}
+
 function start_async_icmp_ping(string $ip, int $timeoutMs)
 {
     $command = build_icmp_ping_command($ip, $timeoutMs);
@@ -505,14 +667,17 @@ function finish_async_icmp_ping(array $task): array
     ];
 }
 
-function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
+function scan_ips_parallel(array $ips, int $poolSize, ?callable $onResult = null): array
 {
-    $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE);
+    $poolSize = clamp_int($poolSize, 1, SCAN_POOL_SIZE_DEFAULT);
     $queue = array_values($ips);
     $running = [];
     $results = [];
     $rttSamples = [];
     $startedAt = microtime(true);
+
+    $processed = 0;
+    $total = count($queue);
 
     while ($queue !== [] || $running !== []) {
         $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
@@ -529,6 +694,10 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
                     'method' => 'ICMP',
                     'hostname' => null,
                 ];
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
             }
             foreach ($queue as $ip) {
                 $results[$ip] = [
@@ -538,20 +707,28 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
                     'method' => 'ICMP',
                     'hostname' => null,
                 ];
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
             }
             break;
         }
 
         $sampleAvg = $rttSamples === []
-            ? DEFAULT_SCAN_TIMEOUT_MS / 3
+            ? get_scan_default_timeout_ms() / 3
             : array_sum($rttSamples) / count($rttSamples);
-        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, SEGMENT_SCAN_TIMEOUT_MAX_MS);
+        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, get_scan_segment_timeout_max_ms());
 
         while ($queue !== [] && count($running) < $poolSize) {
             $ip = array_shift($queue);
             $task = start_async_icmp_ping($ip, $dynamicTimeoutMs);
             if ($task === null) {
                 $results[$ip] = ping_ip($ip, $dynamicTimeoutMs);
+                $processed++;
+                if (is_callable($onResult)) {
+                    $onResult($ip, $results[$ip], $processed, $total);
+                }
                 continue;
             }
             $running[$ip] = $task;
@@ -578,24 +755,34 @@ function scan_ips_parallel(array $ips, int $poolSize = SCAN_POOL_SIZE): array
                 $results[$ip] = apply_tcp_fallback($ip, $icmpResult, $dynamicTimeoutMs);
             }
 
+            $processed++;
+            if (is_callable($onResult)) {
+                $onResult($ip, $results[$ip], $processed, $total);
+            }
+
             unset($running[$ip]);
         }
         unset($task);
 
         if ($running !== []) {
-            usleep(10000);
+            usleep(5000);
         }
     }
 
     return $results;
 }
 
-function run_ping_for_ip(string $ip): void
+function prune_ping_logs(): void
 {
-    $result = ping_ip($ip);
-    $uptime = probe_uptime($ip);
+    $prune = db()->prepare('DELETE FROM ping_logs WHERE pinged_at < :limit');
+    $limit = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->sub(new DateInterval('P7D'))->format(DateTimeInterface::ATOM);
+    $prune->execute(['limit' => $limit]);
+}
+
+function apply_ping_result_for_ip(string $ip, array $result, ?string $uptime = null): void
+{
     $timestamp = now_iso();
-    $lastSeenOnlineAt = $result['status'] === 'OK' ? $timestamp : null;
+    $lastSeenOnlineAt = ($result['status'] ?? 'ERROR') === 'OK' ? $timestamp : null;
 
     $update = db()->prepare('UPDATE ip_registry
         SET last_ping_at = :last_ping_at, last_status = :last_status, last_output = :last_output,
@@ -606,12 +793,12 @@ function run_ping_for_ip(string $ip): void
         WHERE ip_address = :ip_address');
     $update->execute([
         'last_ping_at' => $timestamp,
-        'last_status' => $result['status'],
-        'last_output' => $result['output'],
+        'last_status' => (string) ($result['status'] ?? 'ERROR'),
+        'last_output' => (string) ($result['output'] ?? ''),
         'last_seen_online_at' => $lastSeenOnlineAt,
         'next_auto_ping_at' => next_auto_ping_iso(),
         'last_uptime' => $uptime,
-        'host_name' => $result['hostname'],
+        'host_name' => (string) ($result['hostname'] ?? ''),
         'ip_address' => $ip,
     ]);
 
@@ -619,15 +806,42 @@ function run_ping_for_ip(string $ip): void
         VALUES (:ip_address, :hostname, :status, :output, :pinged_at)');
     $insert->execute([
         'ip_address' => $ip,
-        'hostname' => $result['hostname'],
-        'status' => $result['status'],
-        'output' => $result['output'],
+        'hostname' => (string) ($result['hostname'] ?? ''),
+        'status' => (string) ($result['status'] ?? 'ERROR'),
+        'output' => (string) ($result['output'] ?? ''),
         'pinged_at' => $timestamp,
     ]);
+}
 
-    $prune = db()->prepare('DELETE FROM ping_logs WHERE pinged_at < :limit');
-    $limit = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->sub(new DateInterval('P7D'))->format(DateTimeInterface::ATOM);
-    $prune->execute(['limit' => $limit]);
+function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
+{
+    $result = ping_ip($ip, $timeoutMs ?? get_scan_default_timeout_ms());
+    $uptime = probe_uptime($ip);
+    apply_ping_result_for_ip($ip, $result, $uptime);
+    prune_ping_logs();
+}
+
+function run_ping_all_parallel(int $batchSize = PING_ALL_BATCH_SIZE): void
+{
+    $stmt = db()->query('SELECT ip_address FROM ip_registry ORDER BY COALESCE(ip_sort_int, ' . ipv4_sort_sql_expr('ip_address') . '), ip_address');
+    $rows = $stmt->fetchAll();
+    if ($rows === []) {
+        return;
+    }
+
+    $batchSize = clamp_int($batchSize, 8, 64);
+    $poolSize = clamp_int(get_scan_pool_size(), 1, PING_ALL_POOL_SIZE_MAX);
+
+    foreach (array_chunk($rows, $batchSize) as $chunkRows) {
+        $ips = array_map(static fn(array $row): string => (string) $row['ip_address'], $chunkRows);
+        $results = scan_ips_parallel($ips, $poolSize);
+        foreach ($ips as $ip) {
+            $result = $results[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de ping'];
+            apply_ping_result_for_ip($ip, $result, null);
+        }
+    }
+
+    prune_ping_logs();
 }
 
 function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
@@ -637,12 +851,13 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
     $resolvedAlias = trim((string) ($result['hostname'] ?? ''));
     try {
         $insert = db()->prepare('INSERT INTO ip_registry (
-            ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
+            ip_address, ip_sort_int, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
         ) VALUES (
-            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :next_auto_ping_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
+            :ip_address, :ip_sort_int, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :next_auto_ping_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
         )');
         $insert->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'location' => '',
@@ -664,6 +879,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             last_status = :last_status,
             last_output = :last_output,
             last_uptime = COALESCE(:last_uptime, last_uptime),
+            ip_sort_int = :ip_sort_int,
             alias = CASE
                 WHEN alias IS NULL OR TRIM(alias) = "" OR UPPER(TRIM(alias)) = "LIBRE"
                     THEN COALESCE(NULLIF(:alias, ""), alias)
@@ -678,6 +894,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             'last_status' => $result['status'],
             'last_output' => $result['output'],
             'last_uptime' => $uptime,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'ip_address' => $ip,
@@ -698,12 +915,13 @@ function insert_free_placeholder_ip(string $ip, string $createdBy): bool
     $timestamp = now_iso();
     try {
         $stmt = db()->prepare('INSERT INTO ip_registry (
-            ip_address, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
+            ip_address, ip_sort_int, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
         ) VALUES (
-            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_status, :last_output, :created_at, :created_by
+            :ip_address, :ip_sort_int, :alias, :host_name, :location, :last_ping_at, :last_status, :last_output, :created_at, :created_by
         )');
         $stmt->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => 'LIBRE',
             'host_name' => '',
             'location' => '',
@@ -770,7 +988,7 @@ function resolve_auto_scan_prefix(): ?string
     return (string) array_key_first($segments);
 }
 
-function run_segment_scan(string $prefix, string $createdBy): array
+function run_segment_scan(string $prefix, string $createdBy, ?callable $onProgress = null): array
 {
     $foundOnline = 0;
     $inserted = 0;
@@ -784,26 +1002,30 @@ function run_segment_scan(string $prefix, string $createdBy): array
         $ips[] = $prefix . '.' . $host;
     }
 
-    $scanResults = scan_ips_parallel($ips, SCAN_POOL_SIZE);
     usort($ips, static fn(string $a, string $b): int => ip_sort_value($a) <=> ip_sort_value($b));
-
-    foreach ($ips as $ip) {
-        $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
-        if ($result['status'] !== 'OK') {
+    scan_ips_parallel($ips, get_scan_pool_size(), static function (string $ip, array $result, int $processed, int $total) use (&$foundOnline, &$inserted, &$updated, &$markedFree, $seedOfflineAsFree, $createdBy, $onProgress): void {
+        if (($result['status'] ?? 'ERROR') !== 'OK') {
             if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
                 $markedFree++;
             }
-            continue;
+            if (is_callable($onProgress)) {
+                $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
+            }
+            return;
         }
 
         $foundOnline++;
         $state = upsert_scanned_ip($ip, $result, $createdBy);
         if ($state === 'inserted') {
             $inserted++;
-            continue;
+        } else {
+            $updated++;
         }
-        $updated++;
-    }
+
+        if (is_callable($onProgress)) {
+            $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
+        }
+    });
 
     return [
         'found_online' => $foundOnline,
@@ -812,6 +1034,390 @@ function run_segment_scan(string $prefix, string $createdBy): array
         'marked_free' => $markedFree,
         'seeded_full_segment' => $seedOfflineAsFree,
     ];
+}
+
+function create_background_job(string $type, array $payload, string $createdBy): int
+{
+    $now = now_iso();
+    $stmt = db()->prepare('INSERT INTO background_jobs (job_type, status, payload_json, progress, total, message, created_by, created_at, updated_at)
+        VALUES (:job_type, "queued", :payload_json, 0, 254, :message, :created_by, :created_at, :updated_at)');
+    $stmt->execute([
+        'job_type' => $type,
+        'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        'message' => 'En cola',
+        'created_by' => $createdBy,
+        'created_at' => $now,
+        'updated_at' => $now,
+    ]);
+
+    return (int) db()->lastInsertId();
+}
+
+function get_background_job(int $jobId): ?array
+{
+    $stmt = db()->prepare('SELECT * FROM background_jobs WHERE id = :id');
+    $stmt->execute(['id' => $jobId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function get_latest_active_scan_job(): ?array
+{
+    $stmt = db()->query('SELECT * FROM background_jobs
+        WHERE job_type = "scan_segment" AND status IN ("queued", "running")
+        ORDER BY id DESC LIMIT 1');
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function update_background_job_progress(int $jobId, int $progress, int $total, string $message): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET status = "running", progress = :progress, total = :total, message = :message, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'progress' => $progress,
+        'total' => $total,
+        'message' => $message,
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function finish_background_job(int $jobId, string $status, array $result, string $message): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET status = :status, result_json = :result_json, message = :message, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'status' => $status,
+        'result_json' => json_encode($result, JSON_UNESCAPED_UNICODE),
+        'message' => $message,
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function prune_background_jobs(): void
+{
+    $oldLimit = iso_after_seconds(-3 * 86400);
+    $deleteOld = db()->prepare('DELETE FROM background_jobs
+        WHERE status IN ("completed", "failed") AND updated_at < :old_limit');
+    $deleteOld->execute(['old_limit' => $oldLimit]);
+
+    db()->exec('DELETE FROM background_jobs
+        WHERE id IN (
+            SELECT id FROM background_jobs
+            WHERE status IN ("completed", "failed")
+            ORDER BY id DESC
+            LIMIT -1 OFFSET 300
+        )');
+}
+
+function claim_next_scan_job(): ?array
+{
+    $row = db()->query('SELECT id FROM background_jobs
+        WHERE job_type = "scan_segment" AND status = "queued"
+        ORDER BY id ASC
+        LIMIT 1')->fetch();
+    if (!$row) {
+        return null;
+    }
+
+    $jobId = (int) $row['id'];
+    $claim = db()->prepare('UPDATE background_jobs SET status = "running", updated_at = :updated_at WHERE id = :id AND status = "queued"');
+    $claim->execute(['updated_at' => now_iso(), 'id' => $jobId]);
+    if ($claim->rowCount() < 1) {
+        return null;
+    }
+
+    return get_background_job($jobId);
+}
+
+function resolve_php_cli_binary(): string
+{
+    $bin = trim((string) PHP_BINARY);
+    if ($bin !== '' && is_file($bin)) {
+        return $bin;
+    }
+
+    $phpExe = PHP_BINDIR . DIRECTORY_SEPARATOR . (PHP_OS_FAMILY === 'Windows' ? 'php.exe' : 'php');
+    if (is_file($phpExe)) {
+        return $phpExe;
+    }
+
+    return PHP_OS_FAMILY === 'Windows' ? 'php.exe' : 'php';
+}
+
+function quote_shell_arg(string $arg): string
+{
+    return escapeshellarg($arg);
+}
+
+function build_php_cli_command(array $args): string
+{
+    return implode(' ', array_map('quote_shell_arg', $args));
+}
+
+function run_detached_command(string $command): bool
+{
+    if (PHP_OS_FAMILY === 'Windows') {
+        $winCmd = 'cmd /C start "" /B ' . $command . ' >NUL 2>NUL';
+        $handle = @popen($winCmd, 'r');
+        if (!is_resource($handle)) {
+            return false;
+        }
+        @pclose($handle);
+        return true;
+    }
+
+    @exec($command . ' > /dev/null 2>&1 &', $output, $exitCode);
+    return $exitCode === 0;
+}
+
+function launch_scan_job_worker(int $jobId): bool
+{
+    $phpBin = resolve_php_cli_binary();
+    $scriptPath = __FILE__;
+
+    $daemonCmd = build_php_cli_command([$phpBin, $scriptPath, 'scan-worker']);
+    $jobCmd = build_php_cli_command([$phpBin, $scriptPath, 'run-scan-job', (string) $jobId]);
+
+    $daemonStarted = run_detached_command($daemonCmd);
+    $jobStarted = run_detached_command($jobCmd);
+
+    return $daemonStarted || $jobStarted;
+}
+
+function should_process_scan_slice(array $job, int $minAgeSeconds = 3): bool
+{
+    if (($job['job_type'] ?? '') !== 'scan_segment') {
+        return false;
+    }
+
+    $status = (string) ($job['status'] ?? '');
+    $progress = (int) ($job['progress'] ?? 0);
+    $total = max(1, (int) ($job['total'] ?? 0));
+
+    if ($progress >= $total) {
+        return false;
+    }
+
+    if ($status === 'queued') {
+        return true;
+    }
+    if ($status !== 'running') {
+        return false;
+    }
+
+    $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
+    if ($updatedRaw === '') {
+        return true;
+    }
+
+    try {
+        $updatedAt = new DateTimeImmutable($updatedRaw);
+    } catch (Exception) {
+        return true;
+    }
+
+    return (time() - $updatedAt->getTimestamp()) >= $minAgeSeconds;
+}
+
+function ensure_scan_job_kicked(array $job): void
+{
+    if (($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+    if (($job['status'] ?? '') !== 'queued') {
+        return;
+    }
+
+    $jobId = (int) ($job['id'] ?? 0);
+    if ($jobId <= 0) {
+        return;
+    }
+
+    $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
+    if ($updatedRaw === '') {
+        launch_scan_job_worker($jobId);
+        return;
+    }
+
+    try {
+        $updatedAt = new DateTimeImmutable($updatedRaw);
+    } catch (Exception) {
+        launch_scan_job_worker($jobId);
+        return;
+    }
+
+    $age = time() - $updatedAt->getTimestamp();
+    if ($age < 3) {
+        return;
+    }
+
+    if (!launch_scan_job_worker($jobId) && $age >= 10) {
+        update_background_job_progress($jobId, 0, 254, 'No se pudo iniciar el worker automáticamente. Verifica permisos de exec/proc_open en PHP.');
+    }
+}
+
+function run_scan_job_worker(int $jobId): void
+{
+    $job = get_background_job($jobId);
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+
+    $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
+    if (!is_array($payload)) {
+        finish_background_job($jobId, 'failed', [], 'Payload inválido');
+        return;
+    }
+
+    $prefix = (string) ($payload['prefix'] ?? '');
+    $createdBy = (string) ($payload['created_by'] ?? 'system');
+    if ($prefix === '') {
+        finish_background_job($jobId, 'failed', [], 'Segmento inválido');
+        return;
+    }
+
+    update_background_job_progress($jobId, 0, 254, 'Iniciando escaneo...');
+
+    try {
+        $stats = run_segment_scan($prefix, $createdBy, static function (int $progress, int $total, string $message) use ($jobId): void {
+            update_background_job_progress($jobId, $progress, $total, $message);
+        });
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+    } catch (Throwable $e) {
+        finish_background_job($jobId, 'failed', [], 'Error: ' . $e->getMessage());
+    }
+}
+
+function update_background_job_payload(int $jobId, array $payload): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET payload_json = :payload_json, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
+{
+    $job = get_background_job($jobId);
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+    if (!in_array((string) ($job['status'] ?? ''), ['queued', 'running'], true)) {
+        return;
+    }
+
+    $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
+    if (!is_array($payload)) {
+        finish_background_job($jobId, 'failed', [], 'Payload inválido');
+        return;
+    }
+
+    $prefix = (string) ($payload['prefix'] ?? '');
+    $createdBy = (string) ($payload['created_by'] ?? 'system');
+    if ($prefix === '') {
+        finish_background_job($jobId, 'failed', [], 'Segmento inválido');
+        return;
+    }
+
+    $nextHost = clamp_int((int) ($payload['next_host'] ?? 1), 1, 255);
+    $seedOfflineAsFree = array_key_exists('seed_offline_as_free', $payload)
+        ? (bool) $payload['seed_offline_as_free']
+        : (count_ips_in_prefix($prefix) === 0);
+
+    $stats = [
+        'found_online' => (int) ($payload['found_online'] ?? 0),
+        'inserted' => (int) ($payload['inserted'] ?? 0),
+        'updated' => (int) ($payload['updated'] ?? 0),
+        'marked_free' => (int) ($payload['marked_free'] ?? 0),
+        'seeded_full_segment' => $seedOfflineAsFree,
+    ];
+
+    if ($nextHost > 254) {
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+        return;
+    }
+
+    $batchHosts = clamp_int($batchHosts, 1, 32);
+    $endHost = min(254, $nextHost + $batchHosts - 1);
+
+    $ips = [];
+    for ($host = $nextHost; $host <= $endHost; $host++) {
+        $ips[] = $prefix . '.' . $host;
+    }
+
+    update_background_job_progress($jobId, $nextHost - 1, 254, sprintf('Escaneando %s.%d-%d', $prefix, $nextHost, $endHost));
+
+    $scanResults = scan_ips_parallel($ips, get_scan_pool_size());
+    foreach ($ips as $ip) {
+        $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
+        if (($result['status'] ?? 'ERROR') !== 'OK') {
+            if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
+                $stats['marked_free']++;
+            }
+            continue;
+        }
+
+        $stats['found_online']++;
+        $state = upsert_scanned_ip($ip, $result, $createdBy);
+        if ($state === 'inserted') {
+            $stats['inserted']++;
+        } else {
+            $stats['updated']++;
+        }
+    }
+
+    $payload['next_host'] = $endHost + 1;
+    $payload['seed_offline_as_free'] = $seedOfflineAsFree;
+    $payload['found_online'] = $stats['found_online'];
+    $payload['inserted'] = $stats['inserted'];
+    $payload['updated'] = $stats['updated'];
+    $payload['marked_free'] = $stats['marked_free'];
+    update_background_job_payload($jobId, $payload);
+
+    $processed = min(254, $endHost);
+    update_background_job_progress($jobId, $processed, 254, sprintf('Escaneando %s (%d/254)', $prefix . '.' . $endHost, $processed));
+
+    if ($payload['next_host'] > 254) {
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+    }
+}
+
+function run_scan_worker_loop(int $maxIterations = 120): void
+{
+    $lockPath = DB_DIR . '/scan-worker.lock';
+    $handle = fopen($lockPath, 'c+');
+    if ($handle === false) {
+        return;
+    }
+
+    if (!flock($handle, LOCK_EX | LOCK_NB)) {
+        fclose($handle);
+        return;
+    }
+
+    try {
+        for ($i = 0; $i < $maxIterations; $i++) {
+            prune_background_jobs();
+            $job = claim_next_scan_job();
+            if ($job !== null) {
+                run_scan_job_worker((int) $job['id']);
+                continue;
+            }
+            usleep(1000000);
+        }
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
 }
 
 function run_daily_auto_scan_if_due(): void
@@ -843,6 +1449,22 @@ function run_daily_auto_scan_if_due(): void
     set_app_setting(AUTO_SCAN_LAST_RUN_KEY, now_iso());
 }
 
+function process_pending_scan_slice_for_maintenance(int $batchHosts = 8): void
+{
+    $job = get_latest_active_scan_job();
+    if ($job === null) {
+        return;
+    }
+
+    ensure_scan_job_kicked($job);
+    $job = get_background_job((int) $job['id']) ?? $job;
+    if (!should_process_scan_slice($job, 2)) {
+        return;
+    }
+
+    run_scan_job_slice((int) $job['id'], $batchHosts);
+}
+
 function run_background_maintenance(int $pingLimit = 1): void
 {
     $lockPath = DB_DIR . '/maintenance.lock';
@@ -859,6 +1481,8 @@ function run_background_maintenance(int $pingLimit = 1): void
     try {
         run_due_auto_pings($pingLimit);
         run_daily_auto_scan_if_due();
+        process_pending_scan_slice_for_maintenance(8);
+        prune_background_jobs();
     } finally {
         flock($handle, LOCK_UN);
         fclose($handle);
@@ -885,6 +1509,17 @@ if (PHP_SAPI === 'cli') {
     if ($cliCommand === 'worker') {
         run_background_maintenance(10);
         echo "OK\n";
+        exit(0);
+    }
+    if ($cliCommand === 'run-scan-job') {
+        $jobId = (int) ($argv[2] ?? 0);
+        if ($jobId > 0) {
+            run_scan_job_worker($jobId);
+        }
+        exit(0);
+    }
+    if ($cliCommand === 'scan-worker') {
+        run_scan_worker_loop();
         exit(0);
     }
 }
@@ -979,6 +1614,117 @@ if ($action === 'toggle_theme') {
     redirect($redirectTo);
 }
 
+if ($action === 'save_scan_profile') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede modificar el perfil de escaneo.', 'error');
+        redirect('index.php');
+    }
+
+    $poolSize = clamp_int((int) ($_POST['scan_pool_size'] ?? SCAN_POOL_SIZE_DEFAULT), 1, 256);
+    $defaultTimeout = clamp_int((int) ($_POST['scan_default_timeout_ms'] ?? DEFAULT_SCAN_TIMEOUT_MS), SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $segmentTimeoutMax = clamp_int((int) ($_POST['scan_segment_timeout_max_ms'] ?? SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT), SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+
+    set_app_setting(SCAN_POOL_SIZE_KEY, (string) $poolSize);
+    set_app_setting(SCAN_DEFAULT_TIMEOUT_MS_KEY, (string) $defaultTimeout);
+    set_app_setting(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, (string) $segmentTimeoutMax);
+
+    flash('Perfil de escaneo actualizado.', 'success');
+    redirect('index.php');
+}
+
+if ($action === 'add_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede crear tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $newType = normalize_host_type_label((string) ($_POST['new_host_type'] ?? ''));
+    if ($newType === '') {
+        flash('Debe indicar un tipo válido.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (in_array($newType, $types, true)) {
+        flash('El tipo ya existe.', 'info');
+        redirect('index.php');
+    }
+
+    $types[] = $newType;
+    save_host_types($types);
+    flash('Tipo de equipo agregado.', 'success');
+    redirect('index.php');
+}
+
+if ($action === 'rename_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede modificar tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $oldType = normalize_host_type_label((string) ($_POST['old_host_type'] ?? ''));
+    $newType = normalize_host_type_label((string) ($_POST['renamed_host_type'] ?? ''));
+    if ($oldType === '' || $newType === '') {
+        flash('Debe seleccionar un tipo y su nuevo nombre.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (!in_array($oldType, $types, true)) {
+        flash('El tipo seleccionado no existe.', 'error');
+        redirect('index.php');
+    }
+
+    foreach ($types as &$type) {
+        if ($type === $oldType) {
+            $type = $newType;
+        }
+    }
+    unset($type);
+    save_host_types($types);
+
+    if ($oldType !== $newType) {
+        $updateType = db()->prepare('UPDATE ip_registry SET host_type = :new_type WHERE host_type = :old_type');
+        $updateType->execute(['new_type' => $newType, 'old_type' => $oldType]);
+    }
+
+    flash('Tipo de equipo actualizado.', 'success');
+    redirect('index.php');
+}
+
+if ($action === 'delete_host_type') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede eliminar tipos de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $deleteType = normalize_host_type_label((string) ($_POST['delete_host_type'] ?? ''));
+    if ($deleteType === '') {
+        flash('Debe seleccionar un tipo.', 'error');
+        redirect('index.php');
+    }
+
+    $types = get_host_types();
+    if (!in_array($deleteType, $types, true)) {
+        flash('El tipo seleccionado no existe.', 'error');
+        redirect('index.php');
+    }
+
+    if (count($types) <= 1) {
+        flash('Debe existir al menos un tipo de equipo.', 'error');
+        redirect('index.php');
+    }
+
+    $types = array_values(array_filter($types, static fn(string $type): bool => $type !== $deleteType));
+    save_host_types($types);
+
+    $clearType = db()->prepare('UPDATE ip_registry SET host_type = "" WHERE host_type = :host_type');
+    $clearType->execute(['host_type' => $deleteType]);
+
+    flash('Tipo de equipo eliminado.', 'success');
+    redirect('index.php');
+}
+
 if ($action === 'add_ip') {
     if (!in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)) {
         flash('No tienes permisos para registrar IPs.', 'error');
@@ -995,10 +1741,11 @@ if ($action === 'add_ip') {
     $location = trim((string) ($_POST['location'] ?? ''));
 
     try {
-        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, location, created_at, created_by)
-            VALUES (:ip_address, :alias, :location, :created_at, :created_by)');
+        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, ip_sort_int, alias, location, created_at, created_by)
+            VALUES (:ip_address, :ip_sort_int, :alias, :location, :created_at, :created_by)');
         $stmt->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $alias,
             'location' => $location,
             'created_at' => now_iso(),
@@ -1009,6 +1756,36 @@ if ($action === 'add_ip') {
         flash('La IP ya existe.', 'error');
     }
     redirect('index.php?view=ips');
+}
+
+if ($action === 'scan_job_status') {
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+
+    $jobId = (int) ($_GET['job_id'] ?? 0);
+    $job = $jobId > 0 ? get_background_job($jobId) : get_latest_active_scan_job();
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        json_response(['ok' => false, 'message' => 'No hay escaneo activo.'], 404);
+    }
+
+    ensure_scan_job_kicked($job);
+    $job = get_background_job((int) $job['id']) ?? $job;
+
+    $result = json_decode((string) ($job['result_json'] ?? ''), true);
+    if (!is_array($result)) {
+        $result = [];
+    }
+
+    json_response([
+        'ok' => true,
+        'job_id' => (int) $job['id'],
+        'status' => (string) $job['status'],
+        'progress' => (int) ($job['progress'] ?? 0),
+        'total' => max(1, (int) ($job['total'] ?? 0)),
+        'message' => (string) ($job['message'] ?? ''),
+        'result' => $result,
+    ]);
 }
 
 if ($action === 'scan_segment') {
@@ -1024,13 +1801,20 @@ if ($action === 'scan_segment') {
         redirect('index.php?view=ips');
     }
 
-    $scanStats = run_segment_scan($prefix, $user['username']);
-
-    $message = sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $scanStats['found_online'], $scanStats['inserted'], $scanStats['updated']);
-    if ($scanStats['seeded_full_segment']) {
-        $message .= sprintf(' Marcadas como LIBRE (sin respuesta): %d.', $scanStats['marked_free']);
+    $active = get_latest_active_scan_job();
+    if ($active !== null) {
+        flash('Ya hay un escaneo en ejecución. Espera a que finalice.', 'info');
+        redirect('index.php?view=ips');
     }
-    flash($message, 'success');
+
+    $jobId = create_background_job('scan_segment', [
+        'prefix' => $prefix,
+        'created_by' => $user['username'],
+        'next_host' => 1,
+    ], $user['username']);
+    launch_scan_job_worker($jobId);
+
+    flash('Escaneo iniciado en segundo plano. Puedes seguir usando la página.', 'success');
     $segmentOctet = explode('.', $prefix)[2] ?? '';
     redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
@@ -1042,13 +1826,18 @@ if ($action === 'save_ip') {
         redirect('index.php');
     }
 
+    $hostType = normalize_host_type_label((string) ($_POST['host_type'] ?? ''));
+    if ($hostType !== '' && !in_array($hostType, get_host_types(), true)) {
+        $hostType = '';
+    }
+
     $stmt = db()->prepare('UPDATE ip_registry
         SET alias = :alias, host_name = :host_name, host_type = :host_type, location = :location, notes = :notes
         WHERE ip_address = :ip_address');
     $stmt->execute([
         'alias' => trim((string) ($_POST['alias'] ?? '')),
         'host_name' => trim((string) ($_POST['host_name'] ?? '')),
-        'host_type' => trim((string) ($_POST['host_type'] ?? '')),
+        'host_type' => $hostType,
         'location' => trim((string) ($_POST['location'] ?? '')),
         'notes' => trim((string) ($_POST['notes'] ?? '')),
         'ip_address' => $ip,
@@ -1176,7 +1965,7 @@ if ($action === 'ping_now') {
         redirect($returnTo);
     }
 
-    run_ping_for_ip($ip);
+    run_ping_for_ip($ip, get_manual_ping_timeout_ms());
 
     $rowStmt = db()->prepare('SELECT ip_address, host_name, last_status, last_ping_at FROM ip_registry WHERE ip_address = :ip_address');
     $rowStmt->execute(['ip_address' => $ip]);
@@ -1188,7 +1977,7 @@ if ($action === 'ping_now') {
             'ok' => true,
             'message' => 'Ping ejecutado para ' . $ip . '.',
             'ip' => $ip,
-            'status' => $status,
+            'status' => present_status_label($status),
             'status_class' => $status === 'OK' ? 'ok' : ($status === 'ERROR' ? 'error' : 'unknown'),
             'hostname' => (string) ($row['host_name'] ?? ''),
             'last_ping_at' => (string) ($row['last_ping_at'] ?? ''),
@@ -1201,13 +1990,15 @@ if ($action === 'ping_now') {
 }
 
 if ($action === 'ping_all') {
-    $rows = db()->query('SELECT ip_address FROM ip_registry')->fetchAll();
-    usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
-    foreach ($rows as $row) {
-        run_ping_for_ip($row['ip_address']);
-    }
+    run_ping_all_parallel();
     flash('Ping manual ejecutado para todas las IPs.', 'success');
     redirect('index.php?view=ips');
+}
+
+
+$view = trim((string) ($_GET['view'] ?? 'dashboard'));
+if (!in_array($view, ['dashboard', 'ips'], true)) {
+    $view = 'dashboard';
 }
 
 $segmentFilterInput = trim((string) ($_GET['segment'] ?? ''));
@@ -1215,8 +2006,20 @@ $segmentFilter = normalize_segment_filter($segmentFilterInput);
 $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
 $nameFilterInput = trim((string) ($_GET['name_filter'] ?? ''));
 $locationFilterInput = trim((string) ($_GET['location_filter'] ?? ''));
+$statusFilterInput = strtolower(trim((string) ($_GET['status_filter'] ?? 'all')));
+$allowedStatusFilters = ['all', 'ok', 'error'];
+if (!in_array($statusFilterInput, $allowedStatusFilters, true)) {
+    $statusFilterInput = 'all';
+}
 
-$sql = 'SELECT * FROM ip_registry';
+$perPageOptions = [10, 20, 30, 40, 50, 100, 150, 200, 250];
+$perPageInput = (int) ($_GET['per_page'] ?? 40);
+if (!in_array($perPageInput, $perPageOptions, true)) {
+    $perPageInput = 40;
+}
+$pageInput = max(1, (int) ($_GET['page'] ?? 1));
+
+$sqlFrom = ' FROM ip_registry';
 $params = [];
 $conditions = [];
 if ($segmentFilter !== null) {
@@ -1232,67 +2035,106 @@ if ($segmentFilter !== null) {
     }
 }
 
-if ($ipFilterInput !== '') {
+if (mb_strlen($ipFilterInput) >= 2) {
     $conditions[] = 'ip_address LIKE :ip_filter';
     $params['ip_filter'] = '%' . $ipFilterInput . '%';
 }
 
-if ($nameFilterInput !== '') {
+if (mb_strlen($nameFilterInput) >= 2) {
     $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
     $params['name_filter'] = '%' . $nameFilterInput . '%';
 }
 
-if ($locationFilterInput !== '') {
+if (mb_strlen($locationFilterInput) >= 2) {
     $conditions[] = 'location LIKE :location_filter';
     $params['location_filter'] = '%' . $locationFilterInput . '%';
 }
 
-if ($conditions) {
-    $sql .= ' WHERE ' . implode(' AND ', $conditions);
+if ($statusFilterInput === 'ok') {
+    $conditions[] = 'UPPER(COALESCE(last_status, "")) = "OK"';
+} elseif ($statusFilterInput === 'error') {
+    $conditions[] = 'UPPER(COALESCE(last_status, "")) = "ERROR"';
 }
-$sql .= ' ORDER BY ip_address';
-$stmt = db()->prepare($sql);
-$stmt->execute($params);
-$rows = $stmt->fetchAll();
-usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
 
-foreach ($rows as &$row) {
-    $row['segment'] = compute_segment($row['ip_address']);
+$whereClause = $conditions === [] ? '' : (' WHERE ' . implode(' AND ', $conditions));
+$sortExpr = 'COALESCE(ip_sort_int, ' . ipv4_sort_sql_expr('ip_address') . '), ip_address';
+
+$countStmt = db()->prepare('SELECT COUNT(*)' . $sqlFrom . $whereClause);
+$countStmt->execute($params);
+$totalRows = (int) $countStmt->fetchColumn();
+
+$totalPages = max(1, (int) ceil($totalRows / $perPageInput));
+$currentPage = min($pageInput, $totalPages);
+$offset = ($currentPage - 1) * $perPageInput;
+
+$listSql = 'SELECT ip_address, alias, host_name, host_type, location, notes, last_uptime, last_seen_online_at, last_status, last_ping_at, created_by' . $sqlFrom . $whereClause . ' ORDER BY ' . $sortExpr . ' LIMIT :limit OFFSET :offset';
+$listStmt = db()->prepare($listSql);
+foreach ($params as $k => $v) {
+    $listStmt->bindValue(':' . $k, $v, PDO::PARAM_STR);
 }
-unset($row);
+$listStmt->bindValue(':limit', $perPageInput, PDO::PARAM_INT);
+$listStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+$listStmt->execute();
+$rows = $listStmt->fetchAll();
 
-$allIpRows = db()->query('SELECT ip_address, alias, host_name FROM ip_registry ORDER BY ip_address')->fetchAll();
-$segmentStatsMap = [];
-foreach ($allIpRows as $ipRow) {
-    $segment = compute_segment($ipRow['ip_address']);
-    if (!isset($segmentStatsMap[$segment])) {
-        $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
+$segmentFilterOptions = [];
+if ($view === 'ips') {
+    $segmentOptionRows = db()->query('SELECT DISTINCT CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) AS octet
+        FROM ip_registry
+        WHERE ip_address LIKE "%.%.%.%"
+        ORDER BY octet')->fetchAll();
+    foreach ($segmentOptionRows as $segmentOptionRow) {
+        $octet = (int) ($segmentOptionRow['octet'] ?? -1);
+        if ($octet >= 0 && $octet <= 255) {
+            $segmentFilterOptions[] = (string) $octet;
+        }
     }
-
-    $alias = strtoupper(trim((string) ($ipRow['alias'] ?? '')));
-    $hostname = trim((string) ($ipRow['host_name'] ?? ''));
-    $isFreePlaceholder = $alias === 'LIBRE' && $hostname === '';
-    if (!$isFreePlaceholder) {
-        $segmentStatsMap[$segment]['used']++;
-    }
 }
-foreach ($segmentStatsMap as &$segmentData) {
-    $segmentData['free'] = max(0, 254 - $segmentData['used']);
-}
-unset($segmentData);
-$segmentStats = array_values($segmentStatsMap);
-usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
 
+$baseQueryParams = [
+    'view' => 'ips',
+    'segment' => $segmentFilterInput,
+    'ip_filter' => $ipFilterInput,
+    'name_filter' => $nameFilterInput,
+    'location_filter' => $locationFilterInput,
+    'status_filter' => $statusFilterInput,
+    'per_page' => (string) $perPageInput,
+];
+
+
+$segmentStats = [];
 $dashboardSegment = trim((string) ($_GET['dashboard_segment'] ?? ''));
-if ($dashboardSegment === '' && $segmentStats) {
-    $dashboardSegment = $segmentStats[0]['segment'];
-}
-
 $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
-foreach ($segmentStats as $seg) {
-    if ($seg['segment'] === $dashboardSegment) {
-        $dashboardData = $seg;
-        break;
+if ($view === 'dashboard') {
+    $segmentExpr = "(substr(ip_address, 1, instr(ip_address, '.') - 1) || '.' || "
+        . "substr(substr(ip_address, instr(ip_address, '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + 1), '.') - 1) || '.' || "
+        . "substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), 1, "
+        . "instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') - 1))";
+    $segmentRows = db()->query('SELECT ' . $segmentExpr . ' AS segment,
+        SUM(CASE WHEN UPPER(TRIM(COALESCE(alias, ""))) = "LIBRE" AND TRIM(COALESCE(host_name, "")) = "" THEN 0 ELSE 1 END) AS used
+        FROM ip_registry
+        GROUP BY segment
+        ORDER BY segment')->fetchAll();
+
+    foreach ($segmentRows as $segRow) {
+        $used = (int) ($segRow['used'] ?? 0);
+        $segmentStats[] = [
+            'segment' => (string) ($segRow['segment'] ?? ''),
+            'used' => $used,
+            'free' => max(0, 254 - $used),
+        ];
+    }
+
+    if ($dashboardSegment === '' && $segmentStats !== []) {
+        $dashboardSegment = $segmentStats[0]['segment'];
+    }
+
+    $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
+    foreach ($segmentStats as $seg) {
+        if ($seg['segment'] === $dashboardSegment) {
+            $dashboardData = $seg;
+            break;
+        }
     }
 }
 
@@ -1324,6 +2166,13 @@ if (($action === 'detail' || isset($_GET['ip'])) && validate_ip($detailIp)) {
 $flash = flash();
 $wallpapers = list_wallpapers();
 $selectedWallpaper = get_app_setting('login_wallpaper', '');
+$scanProfile = [
+    'pool_size' => get_scan_pool_size(),
+    'default_timeout_ms' => get_scan_default_timeout_ms(),
+    'segment_timeout_max_ms' => get_scan_segment_timeout_max_ms(),
+];
+$hostTypes = get_host_types();
+$activeScanJob = get_latest_active_scan_job();
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -1335,10 +2184,7 @@ $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
 $showEditUserModal = $user['role'] === ROLE_ADMIN && $modal === 'edit_user';
 $showResetPasswordModal = $user['role'] === ROLE_ADMIN && $modal === 'reset_password';
 $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
-$view = trim((string) ($_GET['view'] ?? 'dashboard'));
-if (!in_array($view, ['dashboard', 'ips'], true)) {
-    $view = 'dashboard';
-}
+$showHostTypesModal = $user['role'] === ROLE_ADMIN && $modal === 'host_types';
 $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 ?>
 <!doctype html>
@@ -1387,6 +2233,32 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                         </div>
 
                         <details class="menu-item flyout-parent">
+                            <summary class="menu-item-title">Escaneo</summary>
+                            <div class="flyout-menu">
+                                <form method="post" class="form-grid compact">
+                                    <input type="hidden" name="action" value="save_scan_profile" />
+                                    <label>Hilos máximos
+                                        <input type="number" min="1" max="256" name="scan_pool_size" value="<?= h((string) $scanProfile['pool_size']) ?>">
+                                    </label>
+                                    <label>Timeout ping por defecto (ms)
+                                        <input type="number" min="<?= h((string) SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_default_timeout_ms" value="<?= h((string) $scanProfile['default_timeout_ms']) ?>">
+                                    </label>
+                                    <label>Timeout máximo escaneo segmento (ms)
+                                        <input type="number" min="<?= h((string) SEGMENT_SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_segment_timeout_max_ms" value="<?= h((string) $scanProfile['segment_timeout_max_ms']) ?>">
+                                    </label>
+                                    <button type="submit" class="btn small">Guardar</button>
+                                </form>
+                            </div>
+                        </details>
+
+                        <details class="menu-item flyout-parent">
+                            <summary class="menu-item-title">Tipos de equipo</summary>
+                            <div class="flyout-menu">
+                                <a class="menu-link menu-link-block" href="index.php?modal=host_types">Gestionar tipos de equipo</a>
+                            </div>
+                        </details>
+
+                        <details class="menu-item flyout-parent">
                             <summary class="menu-item-title">Usuario</summary>
                             <div class="flyout-menu">
                                 <a class="menu-link menu-link-block" href="index.php?modal=create_user">Nuevo usuario</a>
@@ -1404,6 +2276,25 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 
     <?php if ($flash): ?>
         <div class="flash <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div>
+    <?php endif; ?>
+
+    <?php if ($activeScanJob): ?>
+        <?php
+        $jobTotal = max(1, (int) ($activeScanJob['total'] ?? 0));
+        $jobProgress = (int) ($activeScanJob['progress'] ?? 0);
+        $jobPct = (int) round(min(100, max(0, ($jobProgress / $jobTotal) * 100)));
+        ?>
+        <section class="card" id="scan-progress-card" data-job-id="<?= h((string) $activeScanJob['id']) ?>">
+            <div class="card-title-row">
+                <h2>Escaneo en segundo plano</h2>
+                <span class="pill" id="scan-progress-label"><?= h((string) $jobPct) ?>%</span>
+            </div>
+            <div class="muted" id="scan-progress-message"><?= h((string) ($activeScanJob['message'] ?? 'Procesando...')) ?></div>
+            <div style="margin-top:8px; height:12px; border:1px solid var(--border); border-radius:999px; overflow:hidden; background:color-mix(in srgb, var(--surface) 70%, transparent);">
+                <div id="scan-progress-bar" style="height:100%; width:<?= h((string) $jobPct) ?>%; background:linear-gradient(90deg,var(--primary),var(--primary-strong));"></div>
+            </div>
+            <div class="muted" id="scan-progress-counter" style="margin-top:6px;"><?= h((string) $jobProgress) ?> / <?= h((string) $jobTotal) ?> hosts</div>
+        </section>
     <?php endif; ?>
 
     <nav class="view-nav card">
@@ -1509,22 +2400,34 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 
         <details class="card collapsible-card" open>
             <summary><h2>Buscar y filtrar</h2></summary>
-            <form method="get" class="form-grid four">
+            <form method="get" class="form-grid four" id="ips-filter-form">
                 <input type="hidden" name="view" value="ips" />
-                <label>Segmento (/24 o solo rango)
-                    <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
+                <input type="hidden" name="page" value="1" />
+                <label>Segmento (/24)
+                    <select name="segment" onchange="this.form.submit()">
+                        <option value="">Todos</option>
+                        <?php foreach ($segmentFilterOptions as $segmentOption): ?>
+                            <option value="<?= h($segmentOption) ?>" <?= $segmentFilterInput === $segmentOption ? 'selected' : '' ?>><?= h($segmentOption) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
+                <label>Estado
+                    <select name="status_filter" onchange="this.form.submit()">
+                        <option value="all" <?= $statusFilterInput === 'all' ? 'selected' : '' ?>>Todos</option>
+                        <option value="ok" <?= $statusFilterInput === 'ok' ? 'selected' : '' ?>>OK</option>
+                        <option value="error" <?= $statusFilterInput === 'error' ? 'selected' : '' ?>>LIBRE</option>
+                    </select>
                 </label>
                 <label>Número de IP
-                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56">
+                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56 (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <label>Nombre equipo
-                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias">
+                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <label>Ubicación
-                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
+                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2 (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <div class="form-end">
-                    <button type="submit" class="btn small">Aplicar</button>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
                 </div>
             </form>
@@ -1535,13 +2438,16 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <h2>IPs registradas</h2>
                 <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
             </div>
+            <div class="top-actions" style="margin-bottom:10px; gap:8px;">
+                <span class="pill">Filtro actual: <?= h($statusFilterInput === 'error' ? 'LIBRE' : strtoupper($statusFilterInput)) ?></span>
+            </div>
             <div class="table-wrap">
                 <table>
                     <thead>
                     <tr>
                         <th>IP</th>
+                        <th>Alias</th>
                         <th>Ubicación</th>
-                        <th>Detalles</th>
                         <th>Estado</th>
                         <th>Acciones</th>
                     </tr>
@@ -1552,24 +2458,23 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <?php else: ?>
                         <?php foreach ($rows as $row): ?>
                             <tr data-ip-row="<?= h($row['ip_address']) ?>">
-                                <td>
+                                <td class="cell-clip" title="<?= h($row['ip_address']) ?>">
                                     <strong><?= h($row['ip_address']) ?></strong>
-                                    <div class="muted js-hostname"><?= h($row['host_name'] ?: '-') ?></div>
+                                    <details class="row-extra">
+                                        <summary>Más</summary>
+                                        <div class="muted">Nombre: <span class="js-hostname"><?= h($row['host_name'] ?: '-') ?></span></div>
+                                        <div class="muted">Tipo: <?= h($row['host_type'] ?: '-') ?></div>
+                                        <div class="muted">Último uptime: <?= h($row['last_uptime'] ?: '-') ?></div>
+                                        <div class="muted">Último visto: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?></div>
+                                        <div class="muted">Registrado por: <?= h($row['created_by'] ?: '-') ?></div>
+                                        <div class="muted">Notas: <?= h($row['notes'] ?: '-') ?></div>
+                                    </details>
                                 </td>
-                                <td><?= h($row['location'] ?: '-') ?></td>
-                                <td>
-                                    Alias: <?= h($row['alias'] ?: '-') ?><br>
-                                    Nombre: <span class="js-hostname"><?= h($row['host_name'] ?: '-') ?></span><br>
-                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
-                                Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
-                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                            </td>
+                                <td class="cell-clip" title="<?= h($row['alias'] ?: '-') ?>"><?= h($row['alias'] ?: '-') ?></td>
+                                <td class="cell-clip" title="<?= h($row['location'] ?: '-') ?>"><?= h($row['location'] ?: '-') ?></td>
                                 <td class="js-status-cell">
-                                    <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
-                                    <span class="status-pill js-status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
+                                    <?php $statusRaw = (string) ($row['last_status'] ?: 'SIN DATOS'); $statusLabel = present_status_label($statusRaw); ?>
+                                    <span class="status-pill js-status-pill <?= strtoupper($statusRaw) === 'OK' ? 'ok' : ((strtoupper($statusRaw) === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
                                     <div class="muted js-last-ping"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
                                 </td>
                                 <td class="actions-col">
@@ -1587,6 +2492,37 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     </tbody>
                 </table>
             </div>
+            <div class="card-title-row" style="margin-top:10px;">
+                <?php
+                $startRow = $totalRows === 0 ? 0 : ($offset + 1);
+                $endRow = min($offset + $perPageInput, $totalRows);
+                ?>
+                <div class="top-actions" style="gap:8px;">
+                    <div class="muted">Mostrando <?= h((string) $startRow) ?> a <?= h((string) $endRow) ?> de <?= h((string) $totalRows) ?> filas</div>
+                    <form method="get" class="top-actions" style="gap:6px;">
+                        <input type="hidden" name="view" value="ips" />
+                        <input type="hidden" name="segment" value="<?= h($segmentFilterInput) ?>" />
+                        <input type="hidden" name="ip_filter" value="<?= h($ipFilterInput) ?>" />
+                        <input type="hidden" name="name_filter" value="<?= h($nameFilterInput) ?>" />
+                        <input type="hidden" name="location_filter" value="<?= h($locationFilterInput) ?>" />
+                        <input type="hidden" name="status_filter" value="<?= h($statusFilterInput) ?>" />
+                        <input type="hidden" name="page" value="1" />
+                        <label class="muted" style="margin-top:0;">Filas</label>
+                        <select name="per_page" onchange="this.form.submit()" style="width:90px; padding:6px 8px;">
+                            <?php foreach ($perPageOptions as $opt): ?>
+                                <option value="<?= h((string) $opt) ?>" <?= $perPageInput === $opt ? 'selected' : '' ?>><?= h((string) $opt) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </form>
+                </div>
+                <div class="top-actions" style="gap:8px;">
+                    <?php $prevQuery = $baseQueryParams; $prevQuery['page'] = (string) max(1, $currentPage - 1); ?>
+                    <?php $nextQuery = $baseQueryParams; $nextQuery['page'] = (string) min($totalPages, $currentPage + 1); ?>
+                    <a class="btn small <?= $currentPage <= 1 ? 'ghost' : '' ?>" href="index.php?<?= h(http_build_query($prevQuery)) ?>">Anterior</a>
+                    <span class="pill">Página <?= h((string) $currentPage) ?> / <?= h((string) $totalPages) ?></span>
+                    <a class="btn small <?= $currentPage >= $totalPages ? 'ghost' : '' ?>" href="index.php?<?= h(http_build_query($nextQuery)) ?>">Siguiente</a>
+                </div>
+            </div>
         </section>
 
         <?php if ($detail): ?>
@@ -1602,7 +2538,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <label>Tipo
                         <select name="host_type">
                             <option value="">-</option>
-                            <?php foreach (HOST_TYPES as $type): ?>
+                            <?php foreach ($hostTypes as $type): ?>
                                 <option value="<?= h($type) ?>" <?= ($detail['host_type'] === $type) ? 'selected' : '' ?>><?= h($type) ?></option>
                             <?php endforeach; ?>
                         </select>
@@ -1649,6 +2585,62 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             </section>
             </div>
         <?php endif; ?>
+    <?php endif; ?>
+
+    <?php if ($showHostTypesModal): ?>
+        <div class="modal-backdrop">
+            <section class="card modal-card create-user-modal">
+                <h2>Gestionar tipos de equipo</h2>
+                <a class="btn small ghost" href="index.php">Cerrar</a>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;">
+                    <input type="hidden" name="action" value="add_host_type" />
+                    <label>Nuevo tipo
+                        <input type="text" name="new_host_type" placeholder="Ej: SWITCH" required>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn primary small">Agregar</button></div>
+                </form>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;">
+                    <input type="hidden" name="action" value="rename_host_type" />
+                    <label>Modificar tipo
+                        <select name="old_host_type" required>
+                            <?php foreach ($hostTypes as $type): ?>
+                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+                    <label>Nuevo nombre
+                        <input type="text" name="renamed_host_type" required>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn primary small">Guardar cambios</button></div>
+                </form>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;" onsubmit="return confirm('¿Eliminar este tipo de equipo?');">
+                    <input type="hidden" name="action" value="delete_host_type" />
+                    <label>Eliminar tipo
+                        <select name="delete_host_type" required>
+                            <?php foreach ($hostTypes as $type): ?>
+                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn small">Eliminar</button></div>
+                </form>
+
+                <h3>Tipos actuales</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Tipo</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($hostTypes as $type): ?>
+                            <tr><td><?= h($type) ?></td></tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
     <?php endif; ?>
 
     <?php if ($showCreateUserModal): ?>
@@ -1757,6 +2749,68 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const forms = document.querySelectorAll('.js-ping-now-form');
+
+    const scheduleFilterSubmit = (form, value, minLength = 2) => {
+        const text = String(value || '').trim();
+        if (text !== '' && text.length < minLength) {
+            return;
+        }
+        clearTimeout(form._autoTimer);
+        form._autoTimer = setTimeout(() => form.submit(), 700);
+    };
+    window.scheduleFilterSubmit = scheduleFilterSubmit;
+
+    const progressCard = document.getElementById('scan-progress-card');
+    if (progressCard) {
+        const jobId = progressCard.getAttribute('data-job-id');
+        const progressBar = document.getElementById('scan-progress-bar');
+        const progressLabel = document.getElementById('scan-progress-label');
+        const progressCounter = document.getElementById('scan-progress-counter');
+        const progressMessage = document.getElementById('scan-progress-message');
+
+        const poll = async () => {
+            try {
+                const response = await fetch('index.php?action=scan_job_status&job_id=' + encodeURIComponent(jobId), {
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                });
+                if (!response.ok) {
+                    return;
+                }
+                const data = await response.json();
+                if (!data.ok) {
+                    return;
+                }
+
+                const total = Math.max(1, Number(data.total || 1));
+                const progress = Math.max(0, Number(data.progress || 0));
+                const pct = Math.max(0, Math.min(100, Math.round((progress / total) * 100)));
+
+                if (progressBar) progressBar.style.width = pct + '%';
+                if (progressLabel) progressLabel.textContent = pct + '%';
+                if (progressCounter) progressCounter.textContent = progress + ' / ' + total + ' hosts';
+                if (progressMessage) progressMessage.textContent = data.message || 'Procesando...';
+
+                if (data.status === 'completed' || data.status === 'failed') {
+                    setTimeout(() => window.location.reload(), 1200);
+                    return;
+                }
+
+                const nextDelay = data.status === 'queued' ? 2200 : (progress <= 0 ? 1700 : 1000);
+                setTimeout(poll, nextDelay);
+                return;
+            } catch (e) {
+                // Ignorar y volver a intentar
+            }
+
+            setTimeout(poll, 2200);
+        };
+
+        setTimeout(poll, 600);
+    }
+
     forms.forEach((form) => {
         form.addEventListener('submit', async (event) => {
             event.preventDefault();
