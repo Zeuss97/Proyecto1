@@ -1398,6 +1398,22 @@ function run_daily_auto_scan_if_due(): void
     set_app_setting(AUTO_SCAN_LAST_RUN_KEY, now_iso());
 }
 
+function process_pending_scan_slice_for_maintenance(int $batchHosts = 8): void
+{
+    $job = get_latest_active_scan_job();
+    if ($job === null) {
+        return;
+    }
+
+    ensure_scan_job_kicked($job);
+    $job = get_background_job((int) $job['id']) ?? $job;
+    if (!should_process_scan_slice($job, 2)) {
+        return;
+    }
+
+    run_scan_job_slice((int) $job['id'], $batchHosts);
+}
+
 function run_background_maintenance(int $pingLimit = 1): void
 {
     $lockPath = DB_DIR . '/maintenance.lock';
@@ -1414,6 +1430,7 @@ function run_background_maintenance(int $pingLimit = 1): void
     try {
         run_due_auto_pings($pingLimit);
         run_daily_auto_scan_if_due();
+        process_pending_scan_slice_for_maintenance(8);
         prune_background_jobs();
     } finally {
         flock($handle, LOCK_UN);
@@ -1703,11 +1720,6 @@ if ($action === 'scan_job_status') {
     ensure_scan_job_kicked($job);
     $job = get_background_job((int) $job['id']) ?? $job;
 
-    if (should_process_scan_slice($job, 3)) {
-        run_scan_job_slice((int) $job['id'], 16);
-        $job = get_background_job((int) $job['id']) ?? $job;
-    }
-
     $result = json_decode((string) ($job['result_json'] ?? ''), true);
     if (!is_array($result)) {
         $result = [];
@@ -1975,17 +1987,17 @@ if ($segmentFilter !== null) {
     }
 }
 
-if ($ipFilterInput !== '') {
+if (mb_strlen($ipFilterInput) >= 2) {
     $conditions[] = 'ip_address LIKE :ip_filter';
     $params['ip_filter'] = '%' . $ipFilterInput . '%';
 }
 
-if ($nameFilterInput !== '') {
+if (mb_strlen($nameFilterInput) >= 2) {
     $conditions[] = '(host_name LIKE :name_filter OR alias LIKE :name_filter)';
     $params['name_filter'] = '%' . $nameFilterInput . '%';
 }
 
-if ($locationFilterInput !== '') {
+if (mb_strlen($locationFilterInput) >= 2) {
     $conditions[] = 'location LIKE :location_filter';
     $params['location_filter'] = '%' . $locationFilterInput . '%';
 }
@@ -2017,15 +2029,17 @@ $listStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
 $listStmt->execute();
 $rows = $listStmt->fetchAll();
 
-$segmentOptionRows = db()->query('SELECT DISTINCT CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) AS octet
-    FROM ip_registry
-    WHERE ip_address LIKE "%.%.%.%"
-    ORDER BY octet')->fetchAll();
 $segmentFilterOptions = [];
-foreach ($segmentOptionRows as $segmentOptionRow) {
-    $octet = (int) ($segmentOptionRow['octet'] ?? -1);
-    if ($octet >= 0 && $octet <= 255) {
-        $segmentFilterOptions[] = (string) $octet;
+if ($view === 'ips') {
+    $segmentOptionRows = db()->query('SELECT DISTINCT CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) AS octet
+        FROM ip_registry
+        WHERE ip_address LIKE "%.%.%.%"
+        ORDER BY octet')->fetchAll();
+    foreach ($segmentOptionRows as $segmentOptionRow) {
+        $octet = (int) ($segmentOptionRow['octet'] ?? -1);
+        if ($octet >= 0 && $octet <= 255) {
+            $segmentFilterOptions[] = (string) $octet;
+        }
     }
 }
 
@@ -2357,13 +2371,13 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     </select>
                 </label>
                 <label>Número de IP
-                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
+                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56 (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
                 </label>
                 <label>Nombre equipo
-                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
+                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
                 </label>
                 <label>Ubicación
-                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
+                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2 (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
                 </label>
                 <div class="form-end">
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
@@ -2725,11 +2739,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     setTimeout(() => window.location.reload(), 1200);
                     return;
                 }
+
+                const nextDelay = data.status === 'queued' ? 2200 : (progress <= 0 ? 1700 : 1000);
+                setTimeout(poll, nextDelay);
+                return;
             } catch (e) {
                 // Ignorar y volver a intentar
             }
 
-            setTimeout(poll, 1500);
+            setTimeout(poll, 2200);
         };
 
         setTimeout(poll, 600);
