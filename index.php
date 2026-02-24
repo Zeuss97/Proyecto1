@@ -361,6 +361,18 @@ function ip_sort_value(string $ip): int
     return PHP_INT_MAX;
 }
 
+function ipv4_sort_sql_expr(string $field = 'ip_address'): string
+{
+    $octet1 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $field);
+    $rest1 = sprintf('substr(%1$s, instr(%1$s, ".") + 1)', $field);
+    $octet2 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $rest1);
+    $rest2 = sprintf('substr(%1$s, instr(%1$s, ".") + 1)', $rest1);
+    $octet3 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $rest2);
+    $octet4 = sprintf('CAST(substr(%1$s, instr(%1$s, ".") + 1) AS INTEGER)', $rest2);
+
+    return '(' . $octet1 . ' * 16777216 + ' . $octet2 . ' * 65536 + ' . $octet3 . ' * 256 + ' . $octet4 . ')';
+}
+
 function normalize_segment_filter(string $input): ?string
 {
     $raw = trim($input);
@@ -1079,19 +1091,6 @@ function run_detached_command(string $command): bool
     return true;
 }
 
-function claim_scan_job_if_queued(int $jobId): bool
-{
-    $claim = db()->prepare('UPDATE background_jobs
-        SET status = "running", updated_at = :updated_at
-        WHERE id = :id AND job_type = "scan_segment" AND status = "queued"');
-    $claim->execute([
-        'updated_at' => now_iso(),
-        'id' => $jobId,
-    ]);
-
-    return $claim->rowCount() > 0;
-}
-
 function launch_scan_job_worker(int $jobId): bool
 {
     $php = escapeshellarg(resolve_php_cli_binary());
@@ -1139,12 +1138,6 @@ function ensure_scan_job_kicked(array $job): void
     }
 
     launch_scan_job_worker($jobId);
-
-    // Último recurso: si el entorno no permite procesos en segundo plano (común en algunos XAMPP),
-    // ejecutar inline desde el polling para que no quede eternamente en cola.
-    if ($age >= 10 && claim_scan_job_if_queued($jobId)) {
-        run_scan_job_worker($jobId);
-    }
 }
 
 function run_scan_job_worker(int $jobId): void
@@ -1529,6 +1522,10 @@ if ($action === 'add_ip') {
 }
 
 if ($action === 'scan_job_status') {
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+
     $jobId = (int) ($_GET['job_id'] ?? 0);
     $job = $jobId > 0 ? get_background_job($jobId) : get_latest_active_scan_job();
     if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
@@ -1828,7 +1825,7 @@ if ($statusFilterInput === 'ok') {
 }
 
 $whereClause = $conditions === [] ? '' : (' WHERE ' . implode(' AND ', $conditions));
-$sortExpr = 'ip_address';
+$sortExpr = ipv4_sort_sql_expr('ip_address') . ', ip_address';
 
 $countStmt = db()->prepare('SELECT COUNT(*)' . $sqlFrom . $whereClause);
 $countStmt->execute($params);
