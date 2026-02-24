@@ -174,14 +174,20 @@ function init_db(): void
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ping_logs_ip_pinged_at ON ping_logs(ip_address, pinged_at DESC)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_background_jobs_status_updated ON background_jobs(status, updated_at)');
 
-    $pdo->exec('UPDATE ip_registry
-        SET ip_sort_int = (
-            CAST(substr(ip_address, 1, instr(ip_address, '.') - 1) AS INTEGER) * 16777216 +
-            CAST(substr(substr(ip_address, instr(ip_address, '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + 1), '.') - 1) AS INTEGER) * 65536 +
-            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') - 1) AS INTEGER) * 256 +
-            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') + 1) AS INTEGER)
-        )
-        WHERE ip_sort_int IS NULL AND ip_address LIKE "%.%.%.%"');
+    $missingSortRows = $pdo->query('SELECT id, ip_address FROM ip_registry WHERE ip_sort_int IS NULL')->fetchAll();
+    if ($missingSortRows !== []) {
+        $fillSort = $pdo->prepare('UPDATE ip_registry SET ip_sort_int = :ip_sort_int WHERE id = :id');
+        foreach ($missingSortRows as $sortRow) {
+            $ip = (string) ($sortRow['ip_address'] ?? '');
+            if ($ip === '') {
+                continue;
+            }
+            $fillSort->execute([
+                'ip_sort_int' => ip_sort_value($ip),
+                'id' => (int) ($sortRow['id'] ?? 0),
+            ]);
+        }
+    }
 
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
