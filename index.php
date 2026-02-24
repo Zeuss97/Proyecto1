@@ -1079,25 +1079,39 @@ function resolve_php_cli_binary(): string
     return PHP_OS_FAMILY === 'Windows' ? 'php.exe' : 'php';
 }
 
+function quote_shell_arg(string $arg): string
+{
+    return escapeshellarg($arg);
+}
+
+function build_php_cli_command(array $args): string
+{
+    return implode(' ', array_map('quote_shell_arg', $args));
+}
+
 function run_detached_command(string $command): bool
 {
     if (PHP_OS_FAMILY === 'Windows') {
-        $winCmd = 'cmd /C "start "" /B ' . $command . '"';
-        @pclose(@popen($winCmd, 'r'));
+        $winCmd = 'cmd /C start "" /B ' . $command . ' >NUL 2>NUL';
+        $handle = @popen($winCmd, 'r');
+        if (!is_resource($handle)) {
+            return false;
+        }
+        @pclose($handle);
         return true;
     }
 
-    @exec($command . ' > /dev/null 2>&1 &');
-    return true;
+    @exec($command . ' > /dev/null 2>&1 &', $output, $exitCode);
+    return $exitCode === 0;
 }
 
 function launch_scan_job_worker(int $jobId): bool
 {
-    $php = escapeshellarg(resolve_php_cli_binary());
-    $script = escapeshellarg(__FILE__);
+    $phpBin = resolve_php_cli_binary();
+    $scriptPath = __FILE__;
 
-    $daemonCmd = sprintf('%s %s scan-worker', $php, $script);
-    $jobCmd = sprintf('%s %s run-scan-job %d', $php, $script, $jobId);
+    $daemonCmd = build_php_cli_command([$phpBin, $scriptPath, 'scan-worker']);
+    $jobCmd = build_php_cli_command([$phpBin, $scriptPath, 'run-scan-job', (string) $jobId]);
 
     $daemonStarted = run_detached_command($daemonCmd);
     $jobStarted = run_detached_command($jobCmd);
@@ -1137,7 +1151,9 @@ function ensure_scan_job_kicked(array $job): void
         return;
     }
 
-    launch_scan_job_worker($jobId);
+    if (!launch_scan_job_worker($jobId) && $age >= 10) {
+        update_background_job_progress($jobId, 0, 254, 'No se pudo iniciar el worker automáticamente. Verifica permisos de exec/proc_open en PHP.');
+    }
 }
 
 function run_scan_job_worker(int $jobId): void
