@@ -379,7 +379,13 @@ th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: 
 
 .row-extra > summary::-webkit-details-marker { display: none; }
 .muted { color: var(--muted); font-size: .95rem; margin-top:4px; }
-.actions-col { display:flex; gap:8px; flex-wrap:wrap; }
+td.actions-col { white-space: nowrap; }
+td.actions-col .btn,
+td.actions-col form {
+    display: inline-flex;
+    vertical-align: top;
+}
+td.actions-col form { margin: 0 0 0 8px; }
 
 .login-page { display:flex; justify-content:center; align-items:center; padding:20px; }
 .login-card {
