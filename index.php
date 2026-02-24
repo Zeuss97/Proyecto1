@@ -1188,6 +1188,104 @@ function run_scan_job_worker(int $jobId): void
     }
 }
 
+function update_background_job_payload(int $jobId, array $payload): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET payload_json = :payload_json, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
+{
+    $job = get_background_job($jobId);
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+    if (!in_array((string) ($job['status'] ?? ''), ['queued', 'running'], true)) {
+        return;
+    }
+
+    $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
+    if (!is_array($payload)) {
+        finish_background_job($jobId, 'failed', [], 'Payload inválido');
+        return;
+    }
+
+    $prefix = (string) ($payload['prefix'] ?? '');
+    $createdBy = (string) ($payload['created_by'] ?? 'system');
+    if ($prefix === '') {
+        finish_background_job($jobId, 'failed', [], 'Segmento inválido');
+        return;
+    }
+
+    $nextHost = clamp_int((int) ($payload['next_host'] ?? 1), 1, 255);
+    $seedOfflineAsFree = array_key_exists('seed_offline_as_free', $payload)
+        ? (bool) $payload['seed_offline_as_free']
+        : (count_ips_in_prefix($prefix) === 0);
+
+    $stats = [
+        'found_online' => (int) ($payload['found_online'] ?? 0),
+        'inserted' => (int) ($payload['inserted'] ?? 0),
+        'updated' => (int) ($payload['updated'] ?? 0),
+        'marked_free' => (int) ($payload['marked_free'] ?? 0),
+        'seeded_full_segment' => $seedOfflineAsFree,
+    ];
+
+    if ($nextHost > 254) {
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+        return;
+    }
+
+    $batchHosts = clamp_int($batchHosts, 1, 32);
+    $endHost = min(254, $nextHost + $batchHosts - 1);
+
+    $ips = [];
+    for ($host = $nextHost; $host <= $endHost; $host++) {
+        $ips[] = $prefix . '.' . $host;
+    }
+
+    update_background_job_progress($jobId, $nextHost - 1, 254, sprintf('Escaneando %s.%d-%d', $prefix, $nextHost, $endHost));
+
+    $scanResults = scan_ips_parallel($ips, get_scan_pool_size());
+    foreach ($ips as $ip) {
+        $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
+        if (($result['status'] ?? 'ERROR') !== 'OK') {
+            if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
+                $stats['marked_free']++;
+            }
+            continue;
+        }
+
+        $stats['found_online']++;
+        $state = upsert_scanned_ip($ip, $result, $createdBy);
+        if ($state === 'inserted') {
+            $stats['inserted']++;
+        } else {
+            $stats['updated']++;
+        }
+    }
+
+    $payload['next_host'] = $endHost + 1;
+    $payload['seed_offline_as_free'] = $seedOfflineAsFree;
+    $payload['found_online'] = $stats['found_online'];
+    $payload['inserted'] = $stats['inserted'];
+    $payload['updated'] = $stats['updated'];
+    $payload['marked_free'] = $stats['marked_free'];
+    update_background_job_payload($jobId, $payload);
+
+    $processed = min(254, $endHost);
+    update_background_job_progress($jobId, $processed, 254, sprintf('Escaneando %s (%d/254)', $prefix . '.' . $endHost, $processed));
+
+    if ($payload['next_host'] > 254) {
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+    }
+}
+
 function run_scan_worker_loop(int $maxIterations = 120): void
 {
     $lockPath = DB_DIR . '/scan-worker.lock';
@@ -1551,6 +1649,13 @@ if ($action === 'scan_job_status') {
     ensure_scan_job_kicked($job);
     $job = get_background_job((int) $job['id']) ?? $job;
 
+    $status = (string) ($job['status'] ?? '');
+    $progress = (int) ($job['progress'] ?? 0);
+    if ($status === 'queued' || ($status === 'running' && $progress === 0)) {
+        run_scan_job_slice((int) $job['id'], 16);
+        $job = get_background_job((int) $job['id']) ?? $job;
+    }
+
     $result = json_decode((string) ($job['result_json'] ?? ''), true);
     if (!is_array($result)) {
         $result = [];
@@ -1589,6 +1694,7 @@ if ($action === 'scan_segment') {
     $jobId = create_background_job('scan_segment', [
         'prefix' => $prefix,
         'created_by' => $user['username'],
+        'next_host' => 1,
     ], $user['username']);
     launch_scan_job_worker($jobId);
 
