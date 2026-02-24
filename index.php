@@ -946,7 +946,7 @@ function create_background_job(string $type, array $payload, string $createdBy):
 {
     $now = now_iso();
     $stmt = db()->prepare('INSERT INTO background_jobs (job_type, status, payload_json, progress, total, message, created_by, created_at, updated_at)
-        VALUES (:job_type, "queued", :payload_json, 0, 0, :message, :created_by, :created_at, :updated_at)');
+        VALUES (:job_type, "queued", :payload_json, 0, 254, :message, :created_by, :created_at, :updated_at)');
     $stmt->execute([
         'job_type' => $type,
         'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
@@ -1044,8 +1044,42 @@ function launch_scan_job_worker(int $jobId): void
 {
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__FILE__);
-    $cmd = sprintf('%s %s scan-worker > /dev/null 2>&1 &', $php, $script);
-    @exec($cmd);
+
+    // Worker dedicado (cola completa)
+    $daemonCmd = sprintf('%s %s scan-worker > /dev/null 2>&1 &', $php, $script);
+    @exec($daemonCmd);
+
+    // Kick inmediato del job puntual para evitar quedarse en "En cola" si el daemon no levanta.
+    $jobCmd = sprintf('%s %s run-scan-job %d > /dev/null 2>&1 &', $php, $script, $jobId);
+    @exec($jobCmd);
+}
+
+function ensure_scan_job_kicked(array $job): void
+{
+    if (($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+    if (($job['status'] ?? '') !== 'queued') {
+        return;
+    }
+
+    $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
+    if ($updatedRaw === '') {
+        launch_scan_job_worker((int) $job['id']);
+        return;
+    }
+
+    try {
+        $updatedAt = new DateTimeImmutable($updatedRaw);
+    } catch (Exception) {
+        launch_scan_job_worker((int) $job['id']);
+        return;
+    }
+
+    $age = time() - $updatedAt->getTimestamp();
+    if ($age >= 3) {
+        launch_scan_job_worker((int) $job['id']);
+    }
 }
 
 function run_scan_job_worker(int $jobId): void
@@ -1435,6 +1469,9 @@ if ($action === 'scan_job_status') {
     if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
         json_response(['ok' => false, 'message' => 'No hay escaneo activo.'], 404);
     }
+
+    ensure_scan_job_kicked($job);
+    $job = get_background_job((int) $job['id']) ?? $job;
 
     $result = json_decode((string) ($job['result_json'] ?? ''), true);
     if (!is_array($result)) {
