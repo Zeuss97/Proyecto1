@@ -145,6 +145,26 @@ function init_db(): void
         pinged_at TEXT NOT NULL
     )');
 
+    $pdo->exec('CREATE TABLE IF NOT EXISTS background_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        message TEXT,
+        created_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        result_json TEXT
+    )');
+
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_last_status ON ip_registry(last_status)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_location ON ip_registry(location)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_next_ping ON ip_registry(next_auto_ping_at)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ping_logs_ip_pinged_at ON ping_logs(ip_address, pinged_at DESC)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_background_jobs_status_updated ON background_jobs(status, updated_at)');
+
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
     if (!$stmt->fetchColumn()) {
@@ -864,7 +884,7 @@ function resolve_auto_scan_prefix(): ?string
     return (string) array_key_first($segments);
 }
 
-function run_segment_scan(string $prefix, string $createdBy): array
+function run_segment_scan(string $prefix, string $createdBy, ?callable $onProgress = null): array
 {
     $foundOnline = 0;
     $inserted = 0;
@@ -878,25 +898,37 @@ function run_segment_scan(string $prefix, string $createdBy): array
         $ips[] = $prefix . '.' . $host;
     }
 
-    $scanResults = scan_ips_parallel($ips, get_scan_pool_size());
     usort($ips, static fn(string $a, string $b): int => ip_sort_value($a) <=> ip_sort_value($b));
+    $total = count($ips);
+    $processed = 0;
 
-    foreach ($ips as $ip) {
-        $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
-        if ($result['status'] !== 'OK') {
-            if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
-                $markedFree++;
+    foreach (array_chunk($ips, 32) as $chunk) {
+        $scanResults = scan_ips_parallel($chunk, get_scan_pool_size());
+        foreach ($chunk as $ip) {
+            $processed++;
+            $result = $scanResults[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de escaneo'];
+            if ($result['status'] !== 'OK') {
+                if ($seedOfflineAsFree && insert_free_placeholder_ip($ip, $createdBy)) {
+                    $markedFree++;
+                }
+                if (is_callable($onProgress)) {
+                    $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
+                }
+                continue;
             }
-            continue;
-        }
 
-        $foundOnline++;
-        $state = upsert_scanned_ip($ip, $result, $createdBy);
-        if ($state === 'inserted') {
-            $inserted++;
-            continue;
+            $foundOnline++;
+            $state = upsert_scanned_ip($ip, $result, $createdBy);
+            if ($state === 'inserted') {
+                $inserted++;
+            } else {
+                $updated++;
+            }
+
+            if (is_callable($onProgress)) {
+                $onProgress($processed, $total, sprintf('Escaneando %s (%d/%d)', $ip, $processed, $total));
+            }
         }
-        $updated++;
     }
 
     return [
@@ -906,6 +938,108 @@ function run_segment_scan(string $prefix, string $createdBy): array
         'marked_free' => $markedFree,
         'seeded_full_segment' => $seedOfflineAsFree,
     ];
+}
+
+function create_background_job(string $type, array $payload, string $createdBy): int
+{
+    $now = now_iso();
+    $stmt = db()->prepare('INSERT INTO background_jobs (job_type, status, payload_json, progress, total, message, created_by, created_at, updated_at)
+        VALUES (:job_type, "queued", :payload_json, 0, 0, :message, :created_by, :created_at, :updated_at)');
+    $stmt->execute([
+        'job_type' => $type,
+        'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        'message' => 'En cola',
+        'created_by' => $createdBy,
+        'created_at' => $now,
+        'updated_at' => $now,
+    ]);
+
+    return (int) db()->lastInsertId();
+}
+
+function get_background_job(int $jobId): ?array
+{
+    $stmt = db()->prepare('SELECT * FROM background_jobs WHERE id = :id');
+    $stmt->execute(['id' => $jobId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function get_latest_active_scan_job(): ?array
+{
+    $stmt = db()->query('SELECT * FROM background_jobs
+        WHERE job_type = "scan_segment" AND status IN ("queued", "running")
+        ORDER BY id DESC LIMIT 1');
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function update_background_job_progress(int $jobId, int $progress, int $total, string $message): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET status = "running", progress = :progress, total = :total, message = :message, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'progress' => $progress,
+        'total' => $total,
+        'message' => $message,
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function finish_background_job(int $jobId, string $status, array $result, string $message): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET status = :status, result_json = :result_json, message = :message, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'status' => $status,
+        'result_json' => json_encode($result, JSON_UNESCAPED_UNICODE),
+        'message' => $message,
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
+function launch_scan_job_worker(int $jobId): void
+{
+    $php = escapeshellarg(PHP_BINARY);
+    $script = escapeshellarg(__FILE__);
+    $cmd = sprintf('%s %s run-scan-job %d > /dev/null 2>&1 &', $php, $script, $jobId);
+    @exec($cmd);
+}
+
+function run_scan_job_worker(int $jobId): void
+{
+    $job = get_background_job($jobId);
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        return;
+    }
+
+    $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
+    if (!is_array($payload)) {
+        finish_background_job($jobId, 'failed', [], 'Payload inválido');
+        return;
+    }
+
+    $prefix = (string) ($payload['prefix'] ?? '');
+    $createdBy = (string) ($payload['created_by'] ?? 'system');
+    if ($prefix === '') {
+        finish_background_job($jobId, 'failed', [], 'Segmento inválido');
+        return;
+    }
+
+    update_background_job_progress($jobId, 0, 254, 'Iniciando escaneo...');
+
+    try {
+        $stats = run_segment_scan($prefix, $createdBy, static function (int $progress, int $total, string $message) use ($jobId): void {
+            update_background_job_progress($jobId, $progress, $total, $message);
+        });
+        finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
+    } catch (Throwable $e) {
+        finish_background_job($jobId, 'failed', [], 'Error: ' . $e->getMessage());
+    }
 }
 
 function run_daily_auto_scan_if_due(): void
@@ -979,6 +1113,13 @@ if (PHP_SAPI === 'cli') {
     if ($cliCommand === 'worker') {
         run_background_maintenance(10);
         echo "OK\n";
+        exit(0);
+    }
+    if ($cliCommand === 'run-scan-job') {
+        $jobId = (int) ($argv[2] ?? 0);
+        if ($jobId > 0) {
+            run_scan_job_worker($jobId);
+        }
         exit(0);
     }
 }
@@ -1216,6 +1357,29 @@ if ($action === 'add_ip') {
     redirect('index.php?view=ips');
 }
 
+if ($action === 'scan_job_status') {
+    $jobId = (int) ($_GET['job_id'] ?? 0);
+    $job = $jobId > 0 ? get_background_job($jobId) : get_latest_active_scan_job();
+    if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
+        json_response(['ok' => false, 'message' => 'No hay escaneo activo.'], 404);
+    }
+
+    $result = json_decode((string) ($job['result_json'] ?? ''), true);
+    if (!is_array($result)) {
+        $result = [];
+    }
+
+    json_response([
+        'ok' => true,
+        'job_id' => (int) $job['id'],
+        'status' => (string) $job['status'],
+        'progress' => (int) ($job['progress'] ?? 0),
+        'total' => max(1, (int) ($job['total'] ?? 0)),
+        'message' => (string) ($job['message'] ?? ''),
+        'result' => $result,
+    ]);
+}
+
 if ($action === 'scan_segment') {
     if ($user['role'] !== ROLE_ADMIN) {
         flash('Solo admin puede escanear segmentos.', 'error');
@@ -1229,13 +1393,19 @@ if ($action === 'scan_segment') {
         redirect('index.php?view=ips');
     }
 
-    $scanStats = run_segment_scan($prefix, $user['username']);
-
-    $message = sprintf('Escaneo %s. Online: %d, nuevas: %d, actualizadas: %d.', $prefix . '.0/24', $scanStats['found_online'], $scanStats['inserted'], $scanStats['updated']);
-    if ($scanStats['seeded_full_segment']) {
-        $message .= sprintf(' Marcadas como LIBRE (sin respuesta): %d.', $scanStats['marked_free']);
+    $active = get_latest_active_scan_job();
+    if ($active !== null) {
+        flash('Ya hay un escaneo en ejecución. Espera a que finalice.', 'info');
+        redirect('index.php?view=ips');
     }
-    flash($message, 'success');
+
+    $jobId = create_background_job('scan_segment', [
+        'prefix' => $prefix,
+        'created_by' => $user['username'],
+    ], $user['username']);
+    launch_scan_job_worker($jobId);
+
+    flash('Escaneo iniciado en segundo plano. Puedes seguir usando la página.', 'success');
     $segmentOctet = explode('.', $prefix)[2] ?? '';
     redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
@@ -1438,7 +1608,7 @@ if (!in_array($perPageInput, $perPageOptions, true)) {
 }
 $pageInput = max(1, (int) ($_GET['page'] ?? 1));
 
-$sql = 'SELECT * FROM ip_registry';
+$sqlFrom = ' FROM ip_registry';
 $params = [];
 $conditions = [];
 if ($segmentFilter !== null) {
@@ -1477,20 +1647,26 @@ if ($statusFilterInput === 'ok') {
     $conditions[] = 'UPPER(COALESCE(last_status, "")) = "ERROR"';
 }
 
-if ($conditions) {
-    $sql .= ' WHERE ' . implode(' AND ', $conditions);
-}
-$sql .= ' ORDER BY ip_address';
-$stmt = db()->prepare($sql);
-$stmt->execute($params);
-$rows = $stmt->fetchAll();
-usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
+$whereClause = $conditions === [] ? '' : (' WHERE ' . implode(' AND ', $conditions));
+$sortExpr = 'ip_address';
 
-$totalRows = count($rows);
+$countStmt = db()->prepare('SELECT COUNT(*)' . $sqlFrom . $whereClause);
+$countStmt->execute($params);
+$totalRows = (int) $countStmt->fetchColumn();
+
 $totalPages = max(1, (int) ceil($totalRows / $perPageInput));
 $currentPage = min($pageInput, $totalPages);
 $offset = ($currentPage - 1) * $perPageInput;
-$rows = array_slice($rows, $offset, $perPageInput);
+
+$listSql = 'SELECT *' . $sqlFrom . $whereClause . ' ORDER BY ' . $sortExpr . ' LIMIT :limit OFFSET :offset';
+$listStmt = db()->prepare($listSql);
+foreach ($params as $k => $v) {
+    $listStmt->bindValue(':' . $k, $v, PDO::PARAM_STR);
+}
+$listStmt->bindValue(':limit', $perPageInput, PDO::PARAM_INT);
+$listStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+$listStmt->execute();
+$rows = $listStmt->fetchAll();
 
 $baseQueryParams = [
     'view' => 'ips',
@@ -1586,6 +1762,7 @@ $scanProfile = [
     'segment_timeout_max_ms' => get_scan_segment_timeout_max_ms(),
 ];
 $hostTypes = get_host_types();
+$activeScanJob = get_latest_active_scan_job();
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -1723,6 +1900,25 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 
     <?php if ($flash): ?>
         <div class="flash <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div>
+    <?php endif; ?>
+
+    <?php if ($activeScanJob): ?>
+        <?php
+        $jobTotal = max(1, (int) ($activeScanJob['total'] ?? 0));
+        $jobProgress = (int) ($activeScanJob['progress'] ?? 0);
+        $jobPct = (int) round(min(100, max(0, ($jobProgress / $jobTotal) * 100)));
+        ?>
+        <section class="card" id="scan-progress-card" data-job-id="<?= h((string) $activeScanJob['id']) ?>">
+            <div class="card-title-row">
+                <h2>Escaneo en segundo plano</h2>
+                <span class="pill" id="scan-progress-label"><?= h((string) $jobPct) ?>%</span>
+            </div>
+            <div class="muted" id="scan-progress-message"><?= h((string) ($activeScanJob['message'] ?? 'Procesando...')) ?></div>
+            <div style="margin-top:8px; height:12px; border:1px solid var(--border); border-radius:999px; overflow:hidden; background:color-mix(in srgb, var(--surface) 70%, transparent);">
+                <div id="scan-progress-bar" style="height:100%; width:<?= h((string) $jobPct) ?>%; background:linear-gradient(90deg,var(--primary),var(--primary-strong));"></div>
+            </div>
+            <div class="muted" id="scan-progress-counter" style="margin-top:6px;"><?= h((string) $jobProgress) ?> / <?= h((string) $jobTotal) ?> hosts</div>
+        </section>
     <?php endif; ?>
 
     <nav class="view-nav card">
@@ -2123,6 +2319,54 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const forms = document.querySelectorAll('.js-ping-now-form');
+
+    const progressCard = document.getElementById('scan-progress-card');
+    if (progressCard) {
+        const jobId = progressCard.getAttribute('data-job-id');
+        const progressBar = document.getElementById('scan-progress-bar');
+        const progressLabel = document.getElementById('scan-progress-label');
+        const progressCounter = document.getElementById('scan-progress-counter');
+        const progressMessage = document.getElementById('scan-progress-message');
+
+        const poll = async () => {
+            try {
+                const response = await fetch('index.php?action=scan_job_status&job_id=' + encodeURIComponent(jobId), {
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                });
+                if (!response.ok) {
+                    return;
+                }
+                const data = await response.json();
+                if (!data.ok) {
+                    return;
+                }
+
+                const total = Math.max(1, Number(data.total || 1));
+                const progress = Math.max(0, Number(data.progress || 0));
+                const pct = Math.max(0, Math.min(100, Math.round((progress / total) * 100)));
+
+                if (progressBar) progressBar.style.width = pct + '%';
+                if (progressLabel) progressLabel.textContent = pct + '%';
+                if (progressCounter) progressCounter.textContent = progress + ' / ' + total + ' hosts';
+                if (progressMessage) progressMessage.textContent = data.message || 'Procesando...';
+
+                if (data.status === 'completed' || data.status === 'failed') {
+                    setTimeout(() => window.location.reload(), 1200);
+                    return;
+                }
+            } catch (e) {
+                // Ignorar y volver a intentar
+            }
+
+            setTimeout(poll, 1500);
+        };
+
+        setTimeout(poll, 600);
+    }
+
     forms.forEach((form) => {
         form.addEventListener('submit', async (event) => {
             event.preventDefault();
