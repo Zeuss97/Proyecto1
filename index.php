@@ -24,6 +24,8 @@ const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
 const SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT = 2000;
 const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
 const TCP_FALLBACK_PORT = 80;
+const PING_ALL_BATCH_SIZE = 24;
+const PING_ALL_POOL_SIZE_MAX = 64;
 
 session_start();
 
@@ -136,6 +138,9 @@ function init_db(): void
     if (!in_array('next_auto_ping_at', $columnNames, true)) {
         $pdo->exec('ALTER TABLE ip_registry ADD COLUMN next_auto_ping_at TEXT');
     }
+    if (!in_array('ip_sort_int', $columnNames, true)) {
+        $pdo->exec('ALTER TABLE ip_registry ADD COLUMN ip_sort_int INTEGER');
+    }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ping_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,8 +170,18 @@ function init_db(): void
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_alias ON ip_registry(alias)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_host_name ON ip_registry(host_name)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_next_ping ON ip_registry(next_auto_ping_at)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_ip_sort_int ON ip_registry(ip_sort_int, ip_address)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ping_logs_ip_pinged_at ON ping_logs(ip_address, pinged_at DESC)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_background_jobs_status_updated ON background_jobs(status, updated_at)');
+
+    $pdo->exec('UPDATE ip_registry
+        SET ip_sort_int = (
+            CAST(substr(ip_address, 1, instr(ip_address, '.') - 1) AS INTEGER) * 16777216 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + 1), '.') - 1) AS INTEGER) * 65536 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') - 1) AS INTEGER) * 256 +
+            CAST(substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') + 1) AS INTEGER)
+        )
+        WHERE ip_sort_int IS NULL AND ip_address LIKE "%.%.%.%"');
 
     $stmt = $pdo->prepare('SELECT 1 FROM users WHERE username = :username');
     $stmt->execute(['username' => 'admin']);
@@ -757,12 +772,17 @@ function scan_ips_parallel(array $ips, int $poolSize, ?callable $onResult = null
     return $results;
 }
 
-function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
+function prune_ping_logs(): void
 {
-    $result = ping_ip($ip, $timeoutMs ?? get_scan_default_timeout_ms());
-    $uptime = probe_uptime($ip);
+    $prune = db()->prepare('DELETE FROM ping_logs WHERE pinged_at < :limit');
+    $limit = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->sub(new DateInterval('P7D'))->format(DateTimeInterface::ATOM);
+    $prune->execute(['limit' => $limit]);
+}
+
+function apply_ping_result_for_ip(string $ip, array $result, ?string $uptime = null): void
+{
     $timestamp = now_iso();
-    $lastSeenOnlineAt = $result['status'] === 'OK' ? $timestamp : null;
+    $lastSeenOnlineAt = ($result['status'] ?? 'ERROR') === 'OK' ? $timestamp : null;
 
     $update = db()->prepare('UPDATE ip_registry
         SET last_ping_at = :last_ping_at, last_status = :last_status, last_output = :last_output,
@@ -773,12 +793,12 @@ function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
         WHERE ip_address = :ip_address');
     $update->execute([
         'last_ping_at' => $timestamp,
-        'last_status' => $result['status'],
-        'last_output' => $result['output'],
+        'last_status' => (string) ($result['status'] ?? 'ERROR'),
+        'last_output' => (string) ($result['output'] ?? ''),
         'last_seen_online_at' => $lastSeenOnlineAt,
         'next_auto_ping_at' => next_auto_ping_iso(),
         'last_uptime' => $uptime,
-        'host_name' => $result['hostname'],
+        'host_name' => (string) ($result['hostname'] ?? ''),
         'ip_address' => $ip,
     ]);
 
@@ -786,15 +806,42 @@ function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
         VALUES (:ip_address, :hostname, :status, :output, :pinged_at)');
     $insert->execute([
         'ip_address' => $ip,
-        'hostname' => $result['hostname'],
-        'status' => $result['status'],
-        'output' => $result['output'],
+        'hostname' => (string) ($result['hostname'] ?? ''),
+        'status' => (string) ($result['status'] ?? 'ERROR'),
+        'output' => (string) ($result['output'] ?? ''),
         'pinged_at' => $timestamp,
     ]);
+}
 
-    $prune = db()->prepare('DELETE FROM ping_logs WHERE pinged_at < :limit');
-    $limit = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->sub(new DateInterval('P7D'))->format(DateTimeInterface::ATOM);
-    $prune->execute(['limit' => $limit]);
+function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
+{
+    $result = ping_ip($ip, $timeoutMs ?? get_scan_default_timeout_ms());
+    $uptime = probe_uptime($ip);
+    apply_ping_result_for_ip($ip, $result, $uptime);
+    prune_ping_logs();
+}
+
+function run_ping_all_parallel(int $batchSize = PING_ALL_BATCH_SIZE): void
+{
+    $stmt = db()->query('SELECT ip_address FROM ip_registry ORDER BY COALESCE(ip_sort_int, ' . ipv4_sort_sql_expr('ip_address') . '), ip_address');
+    $rows = $stmt->fetchAll();
+    if ($rows === []) {
+        return;
+    }
+
+    $batchSize = clamp_int($batchSize, 8, 64);
+    $poolSize = clamp_int(get_scan_pool_size(), 1, PING_ALL_POOL_SIZE_MAX);
+
+    foreach (array_chunk($rows, $batchSize) as $chunkRows) {
+        $ips = array_map(static fn(array $row): string => (string) $row['ip_address'], $chunkRows);
+        $results = scan_ips_parallel($ips, $poolSize);
+        foreach ($ips as $ip) {
+            $result = $results[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de ping'];
+            apply_ping_result_for_ip($ip, $result, null);
+        }
+    }
+
+    prune_ping_logs();
 }
 
 function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
@@ -804,12 +851,13 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
     $resolvedAlias = trim((string) ($result['hostname'] ?? ''));
     try {
         $insert = db()->prepare('INSERT INTO ip_registry (
-            ip_address, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
+            ip_address, ip_sort_int, alias, host_name, location, last_ping_at, last_seen_online_at, next_auto_ping_at, last_status, last_output, last_uptime, created_at, created_by
         ) VALUES (
-            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :next_auto_ping_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
+            :ip_address, :ip_sort_int, :alias, :host_name, :location, :last_ping_at, :last_seen_online_at, :next_auto_ping_at, :last_status, :last_output, :last_uptime, :created_at, :created_by
         )');
         $insert->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'location' => '',
@@ -831,6 +879,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             last_status = :last_status,
             last_output = :last_output,
             last_uptime = COALESCE(:last_uptime, last_uptime),
+            ip_sort_int = :ip_sort_int,
             alias = CASE
                 WHEN alias IS NULL OR TRIM(alias) = "" OR UPPER(TRIM(alias)) = "LIBRE"
                     THEN COALESCE(NULLIF(:alias, ""), alias)
@@ -845,6 +894,7 @@ function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
             'last_status' => $result['status'],
             'last_output' => $result['output'],
             'last_uptime' => $uptime,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $resolvedAlias,
             'host_name' => $result['hostname'] ?? '',
             'ip_address' => $ip,
@@ -865,12 +915,13 @@ function insert_free_placeholder_ip(string $ip, string $createdBy): bool
     $timestamp = now_iso();
     try {
         $stmt = db()->prepare('INSERT INTO ip_registry (
-            ip_address, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
+            ip_address, ip_sort_int, alias, host_name, location, last_ping_at, last_status, last_output, created_at, created_by
         ) VALUES (
-            :ip_address, :alias, :host_name, :location, :last_ping_at, :last_status, :last_output, :created_at, :created_by
+            :ip_address, :ip_sort_int, :alias, :host_name, :location, :last_ping_at, :last_status, :last_output, :created_at, :created_by
         )');
         $stmt->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => 'LIBRE',
             'host_name' => '',
             'location' => '',
@@ -1690,10 +1741,11 @@ if ($action === 'add_ip') {
     $location = trim((string) ($_POST['location'] ?? ''));
 
     try {
-        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, alias, location, created_at, created_by)
-            VALUES (:ip_address, :alias, :location, :created_at, :created_by)');
+        $stmt = db()->prepare('INSERT INTO ip_registry (ip_address, ip_sort_int, alias, location, created_at, created_by)
+            VALUES (:ip_address, :ip_sort_int, :alias, :location, :created_at, :created_by)');
         $stmt->execute([
             'ip_address' => $ip,
+            'ip_sort_int' => ip_sort_value($ip),
             'alias' => $alias,
             'location' => $location,
             'created_at' => now_iso(),
@@ -1938,11 +1990,7 @@ if ($action === 'ping_now') {
 }
 
 if ($action === 'ping_all') {
-    $rows = db()->query('SELECT ip_address FROM ip_registry')->fetchAll();
-    usort($rows, static fn(array $a, array $b): int => ip_sort_value($a['ip_address']) <=> ip_sort_value($b['ip_address']));
-    foreach ($rows as $row) {
-        run_ping_for_ip($row['ip_address']);
-    }
+    run_ping_all_parallel();
     flash('Ping manual ejecutado para todas las IPs.', 'success');
     redirect('index.php?view=ips');
 }
@@ -2009,7 +2057,7 @@ if ($statusFilterInput === 'ok') {
 }
 
 $whereClause = $conditions === [] ? '' : (' WHERE ' . implode(' AND ', $conditions));
-$sortExpr = ipv4_sort_sql_expr('ip_address') . ', ip_address';
+$sortExpr = 'COALESCE(ip_sort_int, ' . ipv4_sort_sql_expr('ip_address') . '), ip_address';
 
 $countStmt = db()->prepare('SELECT COUNT(*)' . $sqlFrom . $whereClause);
 $countStmt->execute($params);
@@ -2371,13 +2419,13 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     </select>
                 </label>
                 <label>Número de IP
-                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56 (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
+                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56 (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <label>Nombre equipo
-                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
+                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <label>Ubicación
-                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2 (mín. 2)" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 550);">
+                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2 (mín. 2)" oninput="scheduleFilterSubmit(this.form, this.value, 2);">
                 </label>
                 <div class="form-end">
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
@@ -2701,6 +2749,16 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const forms = document.querySelectorAll('.js-ping-now-form');
+
+    const scheduleFilterSubmit = (form, value, minLength = 2) => {
+        const text = String(value || '').trim();
+        if (text !== '' && text.length < minLength) {
+            return;
+        }
+        clearTimeout(form._autoTimer);
+        form._autoTimer = setTimeout(() => form.submit(), 700);
+    };
+    window.scheduleFilterSubmit = scheduleFilterSubmit;
 
     const progressCard = document.getElementById('scan-progress-card');
     if (progressCard) {
