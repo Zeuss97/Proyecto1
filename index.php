@@ -1004,11 +1004,47 @@ function finish_background_job(int $jobId, string $status, array $result, string
     ]);
 }
 
+function prune_background_jobs(): void
+{
+    $oldLimit = iso_after_seconds(-3 * 86400);
+    $deleteOld = db()->prepare('DELETE FROM background_jobs
+        WHERE status IN ("completed", "failed") AND updated_at < :old_limit');
+    $deleteOld->execute(['old_limit' => $oldLimit]);
+
+    db()->exec('DELETE FROM background_jobs
+        WHERE id IN (
+            SELECT id FROM background_jobs
+            WHERE status IN ("completed", "failed")
+            ORDER BY id DESC
+            LIMIT -1 OFFSET 300
+        )');
+}
+
+function claim_next_scan_job(): ?array
+{
+    $row = db()->query('SELECT id FROM background_jobs
+        WHERE job_type = "scan_segment" AND status = "queued"
+        ORDER BY id ASC
+        LIMIT 1')->fetch();
+    if (!$row) {
+        return null;
+    }
+
+    $jobId = (int) $row['id'];
+    $claim = db()->prepare('UPDATE background_jobs SET status = "running", updated_at = :updated_at WHERE id = :id AND status = "queued"');
+    $claim->execute(['updated_at' => now_iso(), 'id' => $jobId]);
+    if ($claim->rowCount() < 1) {
+        return null;
+    }
+
+    return get_background_job($jobId);
+}
+
 function launch_scan_job_worker(int $jobId): void
 {
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__FILE__);
-    $cmd = sprintf('%s %s run-scan-job %d > /dev/null 2>&1 &', $php, $script, $jobId);
+    $cmd = sprintf('%s %s scan-worker > /dev/null 2>&1 &', $php, $script);
     @exec($cmd);
 }
 
@@ -1041,6 +1077,35 @@ function run_scan_job_worker(int $jobId): void
         finish_background_job($jobId, 'completed', $stats, 'Escaneo completado');
     } catch (Throwable $e) {
         finish_background_job($jobId, 'failed', [], 'Error: ' . $e->getMessage());
+    }
+}
+
+function run_scan_worker_loop(int $maxIterations = 120): void
+{
+    $lockPath = DB_DIR . '/scan-worker.lock';
+    $handle = fopen($lockPath, 'c+');
+    if ($handle === false) {
+        return;
+    }
+
+    if (!flock($handle, LOCK_EX | LOCK_NB)) {
+        fclose($handle);
+        return;
+    }
+
+    try {
+        for ($i = 0; $i < $maxIterations; $i++) {
+            prune_background_jobs();
+            $job = claim_next_scan_job();
+            if ($job !== null) {
+                run_scan_job_worker((int) $job['id']);
+                continue;
+            }
+            usleep(1000000);
+        }
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
     }
 }
 
@@ -1089,6 +1154,7 @@ function run_background_maintenance(int $pingLimit = 1): void
     try {
         run_due_auto_pings($pingLimit);
         run_daily_auto_scan_if_due();
+        prune_background_jobs();
     } finally {
         flock($handle, LOCK_UN);
         fclose($handle);
@@ -1122,6 +1188,10 @@ if (PHP_SAPI === 'cli') {
         if ($jobId > 0) {
             run_scan_job_worker($jobId);
         }
+        exit(0);
+    }
+    if ($cliCommand === 'scan-worker') {
+        run_scan_worker_loop();
         exit(0);
     }
 }
