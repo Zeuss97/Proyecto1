@@ -161,6 +161,8 @@ function init_db(): void
 
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_last_status ON ip_registry(last_status)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_location ON ip_registry(location)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_alias ON ip_registry(alias)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_host_name ON ip_registry(host_name)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ip_registry_next_ping ON ip_registry(next_auto_ping_at)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ping_logs_ip_pinged_at ON ping_logs(ip_address, pinged_at DESC)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_background_jobs_status_updated ON background_jobs(status, updated_at)');
@@ -1590,6 +1592,12 @@ if ($action === 'ping_all') {
     redirect('index.php?view=ips');
 }
 
+
+$view = trim((string) ($_GET['view'] ?? 'dashboard'));
+if (!in_array($view, ['dashboard', 'ips'], true)) {
+    $view = 'dashboard';
+}
+
 $segmentFilterInput = trim((string) ($_GET['segment'] ?? ''));
 $segmentFilter = normalize_segment_filter($segmentFilterInput);
 $ipFilterInput = trim((string) ($_GET['ip_filter'] ?? ''));
@@ -1602,9 +1610,9 @@ if (!in_array($statusFilterInput, $allowedStatusFilters, true)) {
 }
 
 $perPageOptions = [10, 20, 30, 40, 50, 100, 150, 200, 250];
-$perPageInput = (int) ($_GET['per_page'] ?? 50);
+$perPageInput = (int) ($_GET['per_page'] ?? 40);
 if (!in_array($perPageInput, $perPageOptions, true)) {
-    $perPageInput = 50;
+    $perPageInput = 40;
 }
 $pageInput = max(1, (int) ($_GET['page'] ?? 1));
 
@@ -1658,7 +1666,7 @@ $totalPages = max(1, (int) ceil($totalRows / $perPageInput));
 $currentPage = min($pageInput, $totalPages);
 $offset = ($currentPage - 1) * $perPageInput;
 
-$listSql = 'SELECT *' . $sqlFrom . $whereClause . ' ORDER BY ' . $sortExpr . ' LIMIT :limit OFFSET :offset';
+$listSql = 'SELECT ip_address, alias, host_name, host_type, location, notes, last_uptime, last_seen_online_at, last_status, last_ping_at, created_by' . $sqlFrom . $whereClause . ' ORDER BY ' . $sortExpr . ' LIMIT :limit OFFSET :offset';
 $listStmt = db()->prepare($listSql);
 foreach ($params as $k => $v) {
     $listStmt->bindValue(':' . $k, $v, PDO::PARAM_STR);
@@ -1688,43 +1696,40 @@ $statusCountsStmt = db()->prepare($statusCountsSql);
 $statusCountsStmt->execute($params);
 $statusCounts = $statusCountsStmt->fetch() ?: ['ok_count' => 0, 'error_count' => 0];
 
-foreach ($rows as &$row) {
-    $row['segment'] = compute_segment($row['ip_address']);
-}
-unset($row);
 
-$allIpRows = db()->query('SELECT ip_address, alias, host_name FROM ip_registry ORDER BY ip_address')->fetchAll();
-$segmentStatsMap = [];
-foreach ($allIpRows as $ipRow) {
-    $segment = compute_segment($ipRow['ip_address']);
-    if (!isset($segmentStatsMap[$segment])) {
-        $segmentStatsMap[$segment] = ['segment' => $segment, 'used' => 0, 'free' => 254];
-    }
-
-    $alias = strtoupper(trim((string) ($ipRow['alias'] ?? '')));
-    $hostname = trim((string) ($ipRow['host_name'] ?? ''));
-    $isFreePlaceholder = $alias === 'LIBRE' && $hostname === '';
-    if (!$isFreePlaceholder) {
-        $segmentStatsMap[$segment]['used']++;
-    }
-}
-foreach ($segmentStatsMap as &$segmentData) {
-    $segmentData['free'] = max(0, 254 - $segmentData['used']);
-}
-unset($segmentData);
-$segmentStats = array_values($segmentStatsMap);
-usort($segmentStats, static fn(array $a, array $b): int => strcmp($a['segment'], $b['segment']));
-
+$segmentStats = [];
 $dashboardSegment = trim((string) ($_GET['dashboard_segment'] ?? ''));
-if ($dashboardSegment === '' && $segmentStats) {
-    $dashboardSegment = $segmentStats[0]['segment'];
-}
-
 $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
-foreach ($segmentStats as $seg) {
-    if ($seg['segment'] === $dashboardSegment) {
-        $dashboardData = $seg;
-        break;
+if ($view === 'dashboard') {
+    $segmentExpr = "(substr(ip_address, 1, instr(ip_address, '.') - 1) || '.' || "
+        . "substr(substr(ip_address, instr(ip_address, '.') + 1), 1, instr(substr(ip_address, instr(ip_address, '.') + 1), '.') - 1) || '.' || "
+        . "substr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), 1, "
+        . "instr(substr(ip_address, instr(ip_address, '.') + instr(substr(ip_address, instr(ip_address, '.') + 1), '.') + 1), '.') - 1))";
+    $segmentRows = db()->query('SELECT ' . $segmentExpr . ' AS segment,
+        SUM(CASE WHEN UPPER(TRIM(COALESCE(alias, ""))) = "LIBRE" AND TRIM(COALESCE(host_name, "")) = "" THEN 0 ELSE 1 END) AS used
+        FROM ip_registry
+        GROUP BY segment
+        ORDER BY segment')->fetchAll();
+
+    foreach ($segmentRows as $segRow) {
+        $used = (int) ($segRow['used'] ?? 0);
+        $segmentStats[] = [
+            'segment' => (string) ($segRow['segment'] ?? ''),
+            'used' => $used,
+            'free' => max(0, 254 - $used),
+        ];
+    }
+
+    if ($dashboardSegment === '' && $segmentStats !== []) {
+        $dashboardSegment = $segmentStats[0]['segment'];
+    }
+
+    $dashboardData = ['segment' => $dashboardSegment, 'used' => 0, 'free' => 254];
+    foreach ($segmentStats as $seg) {
+        if ($seg['segment'] === $dashboardSegment) {
+            $dashboardData = $seg;
+            break;
+        }
     }
 }
 
@@ -1774,10 +1779,6 @@ $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
 $showEditUserModal = $user['role'] === ROLE_ADMIN && $modal === 'edit_user';
 $showResetPasswordModal = $user['role'] === ROLE_ADMIN && $modal === 'reset_password';
 $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
-$view = trim((string) ($_GET['view'] ?? 'dashboard'));
-if (!in_array($view, ['dashboard', 'ips'], true)) {
-    $view = 'dashboard';
-}
 $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 ?>
 <!doctype html>
@@ -2071,8 +2072,8 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <thead>
                     <tr>
                         <th>IP</th>
+                        <th>Alias</th>
                         <th>Ubicación</th>
-                        <th>Detalles</th>
                         <th>Estado</th>
                         <th>Acciones</th>
                     </tr>
@@ -2083,21 +2084,20 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                     <?php else: ?>
                         <?php foreach ($rows as $row): ?>
                             <tr data-ip-row="<?= h($row['ip_address']) ?>">
-                                <td>
+                                <td class="cell-clip" title="<?= h($row['ip_address']) ?>">
                                     <strong><?= h($row['ip_address']) ?></strong>
-                                    <div class="muted js-hostname"><?= h($row['host_name'] ?: '-') ?></div>
+                                    <details class="row-extra">
+                                        <summary>Más</summary>
+                                        <div class="muted">Nombre: <span class="js-hostname"><?= h($row['host_name'] ?: '-') ?></span></div>
+                                        <div class="muted">Tipo: <?= h($row['host_type'] ?: '-') ?></div>
+                                        <div class="muted">Último uptime: <?= h($row['last_uptime'] ?: '-') ?></div>
+                                        <div class="muted">Último visto: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?></div>
+                                        <div class="muted">Registrado por: <?= h($row['created_by'] ?: '-') ?></div>
+                                        <div class="muted">Notas: <?= h($row['notes'] ?: '-') ?></div>
+                                    </details>
                                 </td>
-                                <td><?= h($row['location'] ?: '-') ?></td>
-                                <td>
-                                    Alias: <?= h($row['alias'] ?: '-') ?><br>
-                                    Nombre: <span class="js-hostname"><?= h($row['host_name'] ?: '-') ?></span><br>
-                                Tipo: <?= h($row['host_type'] ?: '-') ?><br>
-                                Ubicación: <?= h($row['location'] ?: '-') ?><br>
-                                Notas: <?= h($row['notes'] ?: '-') ?><br>
-                                Último uptime: <?= h($row['last_uptime'] ?: '-') ?><br>
-                                Último visto online: <?= h($row['last_seen_online_at'] ? format_display_datetime($row['last_seen_online_at']) : '-') ?><br>
-                                Registrado por: <?= h($row['created_by'] ?: '-') ?>
-                            </td>
+                                <td class="cell-clip" title="<?= h($row['alias'] ?: '-') ?>"><?= h($row['alias'] ?: '-') ?></td>
+                                <td class="cell-clip" title="<?= h($row['location'] ?: '-') ?>"><?= h($row['location'] ?: '-') ?></td>
                                 <td class="js-status-cell">
                                     <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
                                     <span class="status-pill js-status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>

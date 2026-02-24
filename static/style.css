@@ -355,10 +355,29 @@ html[data-theme="dark"] textarea { background: rgba(15, 23, 42, 0.78); }
 }
 
 .table-wrap { overflow:auto; }
-table { width:100%; border-collapse: collapse; }
+table { width:100%; border-collapse: collapse; table-layout: fixed; }
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align:left; vertical-align:top; }
 th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: var(--muted); }
 .table-wrap table { will-change: auto; }
+
+.cell-clip {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.row-extra {
+    margin-top: 6px;
+}
+
+.row-extra > summary {
+    cursor: pointer;
+    color: var(--primary);
+    font-weight: 600;
+    list-style: none;
+}
+
+.row-extra > summary::-webkit-details-marker { display: none; }
 .muted { color: var(--muted); font-size: .95rem; margin-top:4px; }
 .actions-col { display:flex; gap:8px; flex-wrap:wrap; }
 
