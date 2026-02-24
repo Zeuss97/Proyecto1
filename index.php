@@ -361,6 +361,19 @@ function ip_sort_value(string $ip): int
     return PHP_INT_MAX;
 }
 
+function present_status_label(string $status): string
+{
+    $normalized = strtoupper(trim($status));
+    if ($normalized === 'ERROR') {
+        return 'LIBRE';
+    }
+    if ($normalized === '') {
+        return 'SIN DATOS';
+    }
+
+    return $normalized;
+}
+
 function ipv4_sort_sql_expr(string $field = 'ip_address'): string
 {
     $octet1 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $field);
@@ -1894,7 +1907,7 @@ if ($action === 'ping_now') {
             'ok' => true,
             'message' => 'Ping ejecutado para ' . $ip . '.',
             'ip' => $ip,
-            'status' => $status,
+            'status' => present_status_label($status),
             'status_class' => $status === 'OK' ? 'ok' : ($status === 'ERROR' ? 'error' : 'unknown'),
             'hostname' => (string) ($row['host_name'] ?? ''),
             'last_ping_at' => (string) ($row['last_ping_at'] ?? ''),
@@ -1971,8 +1984,6 @@ if ($locationFilterInput !== '') {
     $params['location_filter'] = '%' . $locationFilterInput . '%';
 }
 
-$conditionsWithoutStatus = $conditions;
-
 if ($statusFilterInput === 'ok') {
     $conditions[] = 'UPPER(COALESCE(last_status, "")) = "OK"';
 } elseif ($statusFilterInput === 'error') {
@@ -2000,6 +2011,18 @@ $listStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
 $listStmt->execute();
 $rows = $listStmt->fetchAll();
 
+$segmentOptionRows = db()->query('SELECT DISTINCT CAST(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1, instr(substr(ip_address, instr(ip_address, ".") + instr(substr(ip_address, instr(ip_address, ".") + 1), ".") + 1), ".") -1 ) AS INTEGER) AS octet
+    FROM ip_registry
+    WHERE ip_address LIKE "%.%.%.%"
+    ORDER BY octet')->fetchAll();
+$segmentFilterOptions = [];
+foreach ($segmentOptionRows as $segmentOptionRow) {
+    $octet = (int) ($segmentOptionRow['octet'] ?? -1);
+    if ($octet >= 0 && $octet <= 255) {
+        $segmentFilterOptions[] = (string) $octet;
+    }
+}
+
 $baseQueryParams = [
     'view' => 'ips',
     'segment' => $segmentFilterInput,
@@ -2009,16 +2032,6 @@ $baseQueryParams = [
     'status_filter' => $statusFilterInput,
     'per_page' => (string) $perPageInput,
 ];
-$statusCountsSql = 'SELECT
-    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "OK" THEN 1 ELSE 0 END) AS ok_count,
-    SUM(CASE WHEN UPPER(COALESCE(last_status, "")) = "ERROR" THEN 1 ELSE 0 END) AS error_count
-    FROM ip_registry';
-if ($conditionsWithoutStatus !== []) {
-    $statusCountsSql .= ' WHERE ' . implode(' AND ', $conditionsWithoutStatus);
-}
-$statusCountsStmt = db()->prepare($statusCountsSql);
-$statusCountsStmt->execute($params);
-$statusCounts = $statusCountsStmt->fetch() ?: ['ok_count' => 0, 'error_count' => 0];
 
 
 $segmentStats = [];
@@ -2319,23 +2332,34 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 
         <details class="card collapsible-card" open>
             <summary><h2>Buscar y filtrar</h2></summary>
-            <form method="get" class="form-grid four">
+            <form method="get" class="form-grid four" id="ips-filter-form">
                 <input type="hidden" name="view" value="ips" />
                 <input type="hidden" name="page" value="1" />
-                <label>Segmento (/24 o solo rango)
-                    <input type="text" name="segment" value="<?= h($segmentFilterInput) ?>" placeholder="Ej: 56 o 192.168.56.0/24">
+                <label>Segmento (/24)
+                    <select name="segment" onchange="this.form.submit()">
+                        <option value="">Todos</option>
+                        <?php foreach ($segmentFilterOptions as $segmentOption): ?>
+                            <option value="<?= h($segmentOption) ?>" <?= $segmentFilterInput === $segmentOption ? 'selected' : '' ?>><?= h($segmentOption) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
+                <label>Estado
+                    <select name="status_filter" onchange="this.form.submit()">
+                        <option value="all" <?= $statusFilterInput === 'all' ? 'selected' : '' ?>>Todos</option>
+                        <option value="ok" <?= $statusFilterInput === 'ok' ? 'selected' : '' ?>>OK</option>
+                        <option value="error" <?= $statusFilterInput === 'error' ? 'selected' : '' ?>>LIBRE</option>
+                    </select>
                 </label>
                 <label>Número de IP
-                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56">
+                    <input type="text" name="ip_filter" value="<?= h($ipFilterInput) ?>" placeholder="Ej: 192.168.56" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
                 </label>
                 <label>Nombre equipo
-                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias">
+                    <input type="text" name="name_filter" value="<?= h($nameFilterInput) ?>" placeholder="Hostname o alias" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
                 </label>
                 <label>Ubicación
-                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2">
+                    <input type="text" name="location_filter" value="<?= h($locationFilterInput) ?>" placeholder="Ej: Oficina 2" oninput="const f=this.form; clearTimeout(f._autoTimer); f._autoTimer=setTimeout(() => f.submit(), 450);">
                 </label>
                 <div class="form-end">
-                    <button type="submit" class="btn small">Aplicar</button>
                     <a class="btn ghost small" href="index.php?view=ips">Limpiar</a>
                 </div>
             </form>
@@ -2347,19 +2371,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <form method="post"><input type="hidden" name="action" value="ping_all" /><button class="btn primary small">Ejecutar ping manual</button></form>
             </div>
             <div class="top-actions" style="margin-bottom:10px; gap:8px;">
-                <?php
-                $statusButtons = [
-                    'all' => ['label' => 'Todos', 'count' => (int) $totalRows],
-                    'ok' => ['label' => 'OK', 'count' => (int) ($statusCounts['ok_count'] ?? 0)],
-                    'error' => ['label' => 'ERROR', 'count' => (int) ($statusCounts['error_count'] ?? 0)],
-                ];
-                ?>
-                <?php foreach ($statusButtons as $statusKey => $meta): ?>
-                    <?php $query = $baseQueryParams; $query['status_filter'] = $statusKey; $query['page'] = '1'; ?>
-                    <a class="btn small <?= $statusFilterInput === $statusKey ? 'primary' : '' ?>" href="index.php?<?= h(http_build_query($query)) ?>">
-                        <?= h($meta['label']) ?> (<?= h((string) $meta['count']) ?>)
-                    </a>
-                <?php endforeach; ?>
+                <span class="pill">Filtro actual: <?= h($statusFilterInput === 'error' ? 'LIBRE' : strtoupper($statusFilterInput)) ?></span>
             </div>
             <div class="table-wrap">
                 <table>
@@ -2393,8 +2405,8 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                 <td class="cell-clip" title="<?= h($row['alias'] ?: '-') ?>"><?= h($row['alias'] ?: '-') ?></td>
                                 <td class="cell-clip" title="<?= h($row['location'] ?: '-') ?>"><?= h($row['location'] ?: '-') ?></td>
                                 <td class="js-status-cell">
-                                    <?php $statusLabel = strtoupper((string) ($row['last_status'] ?: 'SIN DATOS')); ?>
-                                    <span class="status-pill js-status-pill <?= $statusLabel === 'OK' ? 'ok' : (($statusLabel === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
+                                    <?php $statusRaw = (string) ($row['last_status'] ?: 'SIN DATOS'); $statusLabel = present_status_label($statusRaw); ?>
+                                    <span class="status-pill js-status-pill <?= strtoupper($statusRaw) === 'OK' ? 'ok' : ((strtoupper($statusRaw) === 'ERROR') ? 'error' : 'unknown') ?>"><?= h($statusLabel) ?></span>
                                     <div class="muted js-last-ping"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
                                 </td>
                                 <td class="actions-col">
