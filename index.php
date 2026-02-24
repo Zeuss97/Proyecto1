@@ -1849,6 +1849,7 @@ $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
 $showEditUserModal = $user['role'] === ROLE_ADMIN && $modal === 'edit_user';
 $showResetPasswordModal = $user['role'] === ROLE_ADMIN && $modal === 'reset_password';
 $showListUsersModal = $user['role'] === ROLE_ADMIN && $modal === 'list_users';
+$showHostTypesModal = $user['role'] === ROLE_ADMIN && $modal === 'host_types';
 $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 ?>
 <!doctype html>
@@ -1918,38 +1919,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                         <details class="menu-item flyout-parent">
                             <summary class="menu-item-title">Tipos de equipo</summary>
                             <div class="flyout-menu">
-                                <form method="post" class="form-grid compact">
-                                    <input type="hidden" name="action" value="add_host_type" />
-                                    <label>Nuevo tipo
-                                        <input type="text" name="new_host_type" placeholder="Ej: SWITCH" required>
-                                    </label>
-                                    <button type="submit" class="btn small">Agregar</button>
-                                </form>
-                                <form method="post" class="form-grid compact">
-                                    <input type="hidden" name="action" value="rename_host_type" />
-                                    <label>Modificar tipo
-                                        <select name="old_host_type" required>
-                                            <?php foreach ($hostTypes as $type): ?>
-                                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                    </label>
-                                    <label>Nuevo nombre
-                                        <input type="text" name="renamed_host_type" required>
-                                    </label>
-                                    <button type="submit" class="btn small">Guardar</button>
-                                </form>
-                                <form method="post" class="form-grid compact" onsubmit="return confirm('¿Eliminar este tipo de equipo?');">
-                                    <input type="hidden" name="action" value="delete_host_type" />
-                                    <label>Eliminar tipo
-                                        <select name="delete_host_type" required>
-                                            <?php foreach ($hostTypes as $type): ?>
-                                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                    </label>
-                                    <button type="submit" class="btn small">Eliminar</button>
-                                </form>
+                                <a class="menu-link menu-link-block" href="index.php?modal=host_types">Gestionar tipos de equipo</a>
                             </div>
                         </details>
 
@@ -2281,6 +2251,62 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             </section>
             </div>
         <?php endif; ?>
+    <?php endif; ?>
+
+    <?php if ($showHostTypesModal): ?>
+        <div class="modal-backdrop">
+            <section class="card modal-card create-user-modal">
+                <h2>Gestionar tipos de equipo</h2>
+                <a class="btn small ghost" href="index.php">Cerrar</a>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;">
+                    <input type="hidden" name="action" value="add_host_type" />
+                    <label>Nuevo tipo
+                        <input type="text" name="new_host_type" placeholder="Ej: SWITCH" required>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn primary small">Agregar</button></div>
+                </form>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;">
+                    <input type="hidden" name="action" value="rename_host_type" />
+                    <label>Modificar tipo
+                        <select name="old_host_type" required>
+                            <?php foreach ($hostTypes as $type): ?>
+                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+                    <label>Nuevo nombre
+                        <input type="text" name="renamed_host_type" required>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn primary small">Guardar cambios</button></div>
+                </form>
+
+                <form method="post" class="form-grid two" style="margin-top:10px;" onsubmit="return confirm('¿Eliminar este tipo de equipo?');">
+                    <input type="hidden" name="action" value="delete_host_type" />
+                    <label>Eliminar tipo
+                        <select name="delete_host_type" required>
+                            <?php foreach ($hostTypes as $type): ?>
+                                <option value="<?= h($type) ?>"><?= h($type) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+                    <div class="form-end"><button type="submit" class="btn small">Eliminar</button></div>
+                </form>
+
+                <h3>Tipos actuales</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Tipo</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($hostTypes as $type): ?>
+                            <tr><td><?= h($type) ?></td></tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
     <?php endif; ?>
 
     <?php if ($showCreateUserModal): ?>
