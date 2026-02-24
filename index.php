@@ -1119,6 +1119,41 @@ function launch_scan_job_worker(int $jobId): bool
     return $daemonStarted || $jobStarted;
 }
 
+function should_process_scan_slice(array $job, int $minAgeSeconds = 3): bool
+{
+    if (($job['job_type'] ?? '') !== 'scan_segment') {
+        return false;
+    }
+
+    $status = (string) ($job['status'] ?? '');
+    $progress = (int) ($job['progress'] ?? 0);
+    $total = max(1, (int) ($job['total'] ?? 0));
+
+    if ($progress >= $total) {
+        return false;
+    }
+
+    if ($status === 'queued') {
+        return true;
+    }
+    if ($status !== 'running') {
+        return false;
+    }
+
+    $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
+    if ($updatedRaw === '') {
+        return true;
+    }
+
+    try {
+        $updatedAt = new DateTimeImmutable($updatedRaw);
+    } catch (Exception) {
+        return true;
+    }
+
+    return (time() - $updatedAt->getTimestamp()) >= $minAgeSeconds;
+}
+
 function ensure_scan_job_kicked(array $job): void
 {
     if (($job['job_type'] ?? '') !== 'scan_segment') {
@@ -1649,9 +1684,7 @@ if ($action === 'scan_job_status') {
     ensure_scan_job_kicked($job);
     $job = get_background_job((int) $job['id']) ?? $job;
 
-    $status = (string) ($job['status'] ?? '');
-    $progress = (int) ($job['progress'] ?? 0);
-    if ($status === 'queued' || ($status === 'running' && $progress === 0)) {
+    if (should_process_scan_slice($job, 3)) {
         run_scan_job_slice((int) $job['id'], 16);
         $job = get_background_job((int) $job['id']) ?? $job;
     }
