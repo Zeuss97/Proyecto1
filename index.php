@@ -19,6 +19,7 @@ const SCAN_POOL_SIZE_DEFAULT = 100;
 const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
 const DEFAULT_SCAN_TIMEOUT_MS = 2000;
+const MANUAL_PING_TIMEOUT_MAX_MS = 900;
 const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
 const SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT = 2000;
 const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
@@ -220,6 +221,11 @@ function get_scan_pool_size(): int
 function get_scan_default_timeout_ms(): int
 {
     return get_app_setting_int(SCAN_DEFAULT_TIMEOUT_MS_KEY, DEFAULT_SCAN_TIMEOUT_MS, SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+function get_manual_ping_timeout_ms(): int
+{
+    return clamp_int(get_scan_default_timeout_ms(), SCAN_TIMEOUT_MIN_MS, MANUAL_PING_TIMEOUT_MAX_MS);
 }
 
 function get_scan_segment_timeout_max_ms(): int
@@ -751,9 +757,9 @@ function scan_ips_parallel(array $ips, int $poolSize, ?callable $onResult = null
     return $results;
 }
 
-function run_ping_for_ip(string $ip): void
+function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
 {
-    $result = ping_ip($ip, get_scan_default_timeout_ms());
+    $result = ping_ip($ip, $timeoutMs ?? get_scan_default_timeout_ms());
     $uptime = probe_uptime($ip);
     $timestamp = now_iso();
     $lastSeenOnlineAt = $result['status'] === 'OK' ? $timestamp : null;
@@ -1895,7 +1901,7 @@ if ($action === 'ping_now') {
         redirect($returnTo);
     }
 
-    run_ping_for_ip($ip);
+    run_ping_for_ip($ip, get_manual_ping_timeout_ms());
 
     $rowStmt = db()->prepare('SELECT ip_address, host_name, last_status, last_ping_at FROM ip_registry WHERE ip_address = :ip_address');
     $rowStmt->execute(['ip_address' => $ip]);
