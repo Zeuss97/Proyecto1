@@ -26,6 +26,7 @@ const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
 const TCP_FALLBACK_PORT = 80;
 const PING_ALL_BATCH_SIZE = 24;
 const PING_ALL_POOL_SIZE_MAX = 64;
+const WEB_MAINTENANCE_KICK_INTERVAL_SECONDS = 20;
 
 session_start();
 
@@ -1471,6 +1472,37 @@ function process_pending_scan_slice_for_maintenance(int $batchHosts = 8): void
     run_scan_job_slice((int) $job['id'], $batchHosts);
 }
 
+function launch_general_worker(): bool
+{
+    $phpBin = resolve_php_cli_binary();
+    $scriptPath = __FILE__;
+    $workerCmd = build_php_cli_command([$phpBin, $scriptPath, 'worker']);
+    return run_detached_command($workerCmd);
+}
+
+function maybe_kick_background_worker(): void
+{
+    $lastKickRaw = trim(get_app_setting('background_worker_last_kick_at', ''));
+    $shouldKick = true;
+    if ($lastKickRaw !== '') {
+        try {
+            $lastKick = new DateTimeImmutable($lastKickRaw);
+            $age = time() - $lastKick->getTimestamp();
+            $shouldKick = $age >= WEB_MAINTENANCE_KICK_INTERVAL_SECONDS;
+        } catch (Exception) {
+            $shouldKick = true;
+        }
+    }
+
+    if (!$shouldKick) {
+        return;
+    }
+
+    if (launch_general_worker()) {
+        set_app_setting('background_worker_last_kick_at', now_iso());
+    }
+}
+
 function run_background_maintenance(int $pingLimit = 1): void
 {
     $lockPath = DB_DIR . '/maintenance.lock';
@@ -1530,7 +1562,7 @@ if (PHP_SAPI === 'cli') {
     }
 }
 
-run_background_maintenance();
+maybe_kick_background_worker();
 
 $action = $_POST['action'] ?? $_GET['action'] ?? null;
 $user = current_user();
