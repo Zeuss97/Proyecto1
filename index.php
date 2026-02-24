@@ -1052,18 +1052,58 @@ function claim_next_scan_job(): ?array
     return get_background_job($jobId);
 }
 
-function launch_scan_job_worker(int $jobId): void
+function resolve_php_cli_binary(): string
 {
-    $php = escapeshellarg(PHP_BINARY);
+    $bin = trim((string) PHP_BINARY);
+    if ($bin !== '' && is_file($bin)) {
+        return $bin;
+    }
+
+    $phpExe = PHP_BINDIR . DIRECTORY_SEPARATOR . (PHP_OS_FAMILY === 'Windows' ? 'php.exe' : 'php');
+    if (is_file($phpExe)) {
+        return $phpExe;
+    }
+
+    return PHP_OS_FAMILY === 'Windows' ? 'php.exe' : 'php';
+}
+
+function run_detached_command(string $command): bool
+{
+    if (PHP_OS_FAMILY === 'Windows') {
+        $winCmd = 'cmd /C "start "" /B ' . $command . '"';
+        @pclose(@popen($winCmd, 'r'));
+        return true;
+    }
+
+    @exec($command . ' > /dev/null 2>&1 &');
+    return true;
+}
+
+function claim_scan_job_if_queued(int $jobId): bool
+{
+    $claim = db()->prepare('UPDATE background_jobs
+        SET status = "running", updated_at = :updated_at
+        WHERE id = :id AND job_type = "scan_segment" AND status = "queued"');
+    $claim->execute([
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+
+    return $claim->rowCount() > 0;
+}
+
+function launch_scan_job_worker(int $jobId): bool
+{
+    $php = escapeshellarg(resolve_php_cli_binary());
     $script = escapeshellarg(__FILE__);
 
-    // Worker dedicado (cola completa)
-    $daemonCmd = sprintf('%s %s scan-worker > /dev/null 2>&1 &', $php, $script);
-    @exec($daemonCmd);
+    $daemonCmd = sprintf('%s %s scan-worker', $php, $script);
+    $jobCmd = sprintf('%s %s run-scan-job %d', $php, $script, $jobId);
 
-    // Kick inmediato del job puntual para evitar quedarse en "En cola" si el daemon no levanta.
-    $jobCmd = sprintf('%s %s run-scan-job %d > /dev/null 2>&1 &', $php, $script, $jobId);
-    @exec($jobCmd);
+    $daemonStarted = run_detached_command($daemonCmd);
+    $jobStarted = run_detached_command($jobCmd);
+
+    return $daemonStarted || $jobStarted;
 }
 
 function ensure_scan_job_kicked(array $job): void
@@ -1075,22 +1115,35 @@ function ensure_scan_job_kicked(array $job): void
         return;
     }
 
+    $jobId = (int) ($job['id'] ?? 0);
+    if ($jobId <= 0) {
+        return;
+    }
+
     $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
     if ($updatedRaw === '') {
-        launch_scan_job_worker((int) $job['id']);
+        launch_scan_job_worker($jobId);
         return;
     }
 
     try {
         $updatedAt = new DateTimeImmutable($updatedRaw);
     } catch (Exception) {
-        launch_scan_job_worker((int) $job['id']);
+        launch_scan_job_worker($jobId);
         return;
     }
 
     $age = time() - $updatedAt->getTimestamp();
-    if ($age >= 3) {
-        launch_scan_job_worker((int) $job['id']);
+    if ($age < 3) {
+        return;
+    }
+
+    launch_scan_job_worker($jobId);
+
+    // Último recurso: si el entorno no permite procesos en segundo plano (común en algunos XAMPP),
+    // ejecutar inline desde el polling para que no quede eternamente en cola.
+    if ($age >= 10 && claim_scan_job_if_queued($jobId)) {
+        run_scan_job_worker($jobId);
     }
 }
 
