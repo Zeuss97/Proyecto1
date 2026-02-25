@@ -828,16 +828,21 @@ function run_ping_for_ip(string $ip, ?int $timeoutMs = null): void
     prune_ping_logs();
 }
 
-function run_ping_all_parallel(int $batchSize = PING_ALL_BATCH_SIZE): void
+function run_ping_all_parallel(int $batchSize = PING_ALL_BATCH_SIZE, ?callable $onProgress = null): array
 {
     $stmt = db()->query('SELECT ip_address FROM ip_registry ORDER BY COALESCE(ip_sort_int, ' . ipv4_sort_sql_expr('ip_address') . '), ip_address');
     $rows = $stmt->fetchAll();
+    $total = count($rows);
     if ($rows === []) {
-        return;
+        return ['processed' => 0, 'ok' => 0, 'error' => 0, 'total' => 0];
     }
 
     $batchSize = clamp_int($batchSize, 8, 64);
     $poolSize = clamp_int(get_scan_pool_size(), 1, PING_ALL_POOL_SIZE_MAX);
+
+    $processed = 0;
+    $okCount = 0;
+    $errorCount = 0;
 
     foreach (array_chunk($rows, $batchSize) as $chunkRows) {
         $ips = array_map(static fn(array $row): string => (string) $row['ip_address'], $chunkRows);
@@ -845,10 +850,28 @@ function run_ping_all_parallel(int $batchSize = PING_ALL_BATCH_SIZE): void
         foreach ($ips as $ip) {
             $result = $results[$ip] ?? ['status' => 'ERROR', 'output' => 'Sin resultado de ping'];
             apply_ping_result_for_ip($ip, $result, null);
+
+            $processed++;
+            if (($result['status'] ?? 'ERROR') === 'OK') {
+                $okCount++;
+            } else {
+                $errorCount++;
+            }
+
+            if (is_callable($onProgress)) {
+                $onProgress($processed, $total, sprintf('Ping manual %s (%d/%d)', $ip, $processed, $total));
+            }
         }
     }
 
     prune_ping_logs();
+
+    return [
+        'processed' => $processed,
+        'ok' => $okCount,
+        'error' => $errorCount,
+        'total' => $total,
+    ];
 }
 
 function upsert_scanned_ip(string $ip, array $result, string $createdBy): string
@@ -1046,12 +1069,15 @@ function run_segment_scan(string $prefix, string $createdBy, ?callable $onProgre
 function create_background_job(string $type, array $payload, string $createdBy): int
 {
     $now = now_iso();
+    $total = max(0, (int) ($payload['total'] ?? 254));
+    $message = $total > 0 ? 'En cola' : 'Sin elementos para procesar';
     $stmt = db()->prepare('INSERT INTO background_jobs (job_type, status, payload_json, progress, total, message, created_by, created_at, updated_at)
-        VALUES (:job_type, "queued", :payload_json, 0, 254, :message, :created_by, :created_at, :updated_at)');
+        VALUES (:job_type, "queued", :payload_json, 0, :total, :message, :created_by, :created_at, :updated_at)');
     $stmt->execute([
         'job_type' => $type,
         'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
-        'message' => 'En cola',
+        'total' => $total,
+        'message' => $message,
         'created_by' => $createdBy,
         'created_at' => $now,
         'updated_at' => $now,
@@ -1072,6 +1098,15 @@ function get_latest_active_scan_job(): ?array
 {
     $stmt = db()->query('SELECT * FROM background_jobs
         WHERE job_type = "scan_segment" AND status IN ("queued", "running")
+        ORDER BY id DESC LIMIT 1');
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function get_latest_active_ping_all_job(): ?array
+{
+    $stmt = db()->query('SELECT * FROM background_jobs
+        WHERE job_type = "ping_all" AND status IN ("queued", "running")
         ORDER BY id DESC LIMIT 1');
     $row = $stmt->fetch();
     return $row ?: null;
@@ -1125,6 +1160,26 @@ function claim_next_scan_job(): ?array
 {
     $row = db()->query('SELECT id FROM background_jobs
         WHERE job_type = "scan_segment" AND status = "queued"
+        ORDER BY id ASC
+        LIMIT 1')->fetch();
+    if (!$row) {
+        return null;
+    }
+
+    $jobId = (int) $row['id'];
+    $claim = db()->prepare('UPDATE background_jobs SET status = "running", updated_at = :updated_at WHERE id = :id AND status = "queued"');
+    $claim->execute(['updated_at' => now_iso(), 'id' => $jobId]);
+    if ($claim->rowCount() < 1) {
+        return null;
+    }
+
+    return get_background_job($jobId);
+}
+
+function claim_next_ping_all_job(): ?array
+{
+    $row = db()->query('SELECT id FROM background_jobs
+        WHERE job_type = "ping_all" AND status = "queued"
         ORDER BY id ASC
         LIMIT 1')->fetch();
     if (!$row) {
@@ -1398,6 +1453,32 @@ function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
     }
 }
 
+function run_ping_all_job_worker(int $jobId): void
+{
+    $job = get_background_job($jobId);
+    if ($job === null || ($job['job_type'] ?? '') !== 'ping_all') {
+        return;
+    }
+
+    $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
+    if (!is_array($payload)) {
+        $payload = [];
+    }
+
+    $batchSize = clamp_int((int) ($payload['batch_size'] ?? PING_ALL_BATCH_SIZE), 8, 64);
+    $total = max(0, (int) ($payload['total'] ?? 0));
+    update_background_job_progress($jobId, 0, max(1, $total), 'Iniciando ping manual...');
+
+    try {
+        $stats = run_ping_all_parallel($batchSize, static function (int $progress, int $jobTotal, string $message) use ($jobId): void {
+            update_background_job_progress($jobId, $progress, max(1, $jobTotal), $message);
+        });
+        finish_background_job($jobId, 'completed', $stats, 'Ping manual finalizado');
+    } catch (Throwable $e) {
+        finish_background_job($jobId, 'failed', [], 'Error: ' . $e->getMessage());
+    }
+}
+
 function run_scan_worker_loop(int $maxIterations = 120): void
 {
     $lockPath = DB_DIR . '/scan-worker.lock';
@@ -1519,6 +1600,12 @@ function run_background_maintenance(int $pingLimit = 1): void
     try {
         run_due_auto_pings($pingLimit);
         run_daily_auto_scan_if_due();
+
+        $pendingPingAllJob = claim_next_ping_all_job();
+        if ($pendingPingAllJob !== null) {
+            run_ping_all_job_worker((int) $pendingPingAllJob['id']);
+        }
+
         process_pending_scan_slice_for_maintenance(8);
         prune_background_jobs();
     } finally {
@@ -2028,8 +2115,21 @@ if ($action === 'ping_now') {
 }
 
 if ($action === 'ping_all') {
-    run_ping_all_parallel();
-    flash('Ping manual ejecutado para todas las IPs.', 'success');
+    $activePingAll = get_latest_active_ping_all_job();
+    if ($activePingAll !== null) {
+        flash('Ya hay un ping manual en ejecución. Espera a que finalice.', 'info');
+        redirect('index.php?view=ips');
+    }
+
+    $totalIps = (int) db()->query('SELECT COUNT(*) FROM ip_registry')->fetchColumn();
+    $jobId = create_background_job('ping_all', [
+        'created_by' => $user['username'],
+        'batch_size' => PING_ALL_BATCH_SIZE,
+        'total' => $totalIps,
+    ], $user['username']);
+    launch_general_worker();
+
+    flash('Ping manual iniciado en segundo plano.', 'success');
     redirect('index.php?view=ips');
 }
 
