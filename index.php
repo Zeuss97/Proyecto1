@@ -2364,13 +2364,21 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             <details class="settings-menu theme-menu">
                 <summary class="btn">Tema: <?= h(ucfirst($theme)) ?></summary>
                 <div class="settings-panel menu-panel theme-panel">
-                    <?php foreach (['light' => 'Light', 'dark' => 'Dark', 'auto' => 'Auto'] as $themeValue => $themeLabel): ?>
+                    <?php
+                    $themeOptions = [
+                        'light' => ['label' => 'Light', 'icon' => '☀️'],
+                        'dark' => ['label' => 'Dark', 'icon' => '🌙'],
+                        'auto' => ['label' => 'Auto', 'icon' => '◐'],
+                    ];
+                    ?>
+                    <?php foreach ($themeOptions as $themeValue => $themeMeta): ?>
                         <form method="post" class="theme-option-form">
                             <input type="hidden" name="action" value="set_theme">
                             <input type="hidden" name="theme" value="<?= h($themeValue) ?>">
                             <input type="hidden" name="redirect_to" value="<?= h($currentUrl) ?>">
                             <button class="btn small <?= $theme === $themeValue ? 'primary' : 'ghost' ?>" type="submit">
-                                <?= h($themeLabel) ?><?= $theme === $themeValue ? ' ✓' : '' ?>
+                                <span class="theme-icon" aria-hidden="true"><?= h($themeMeta['icon']) ?></span>
+                                <span><?= h($themeMeta['label']) ?></span><?= $theme === $themeValue ? ' ✓' : '' ?>
                             </button>
                         </form>
                     <?php endforeach; ?>
