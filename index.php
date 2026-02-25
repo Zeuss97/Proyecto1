@@ -402,6 +402,11 @@ function present_status_label(string $status): string
     return $normalized;
 }
 
+function ip_anchor_id(string $ip): string
+{
+    return 'ip-row-' . preg_replace('/[^a-zA-Z0-9_-]+/', '-', $ip);
+}
+
 function ipv4_sort_sql_expr(string $field = 'ip_address'): string
 {
     $octet1 = sprintf('CAST(substr(%1$s, 1, instr(%1$s, ".") - 1) AS INTEGER)', $field);
@@ -1733,8 +1738,18 @@ if ($action === 'set_wallpaper') {
     redirect('index.php');
 }
 
-if ($action === 'toggle_theme') {
-    $_SESSION['theme'] = (($_SESSION['theme'] ?? 'light') === 'light') ? 'dark' : 'light';
+if ($action === 'set_theme' || $action === 'toggle_theme') {
+    $currentTheme = strtolower(trim((string) ($_SESSION['theme'] ?? 'light')));
+    $themeInput = strtolower(trim((string) ($_POST['theme'] ?? '')));
+    if ($themeInput === '') {
+        $themeInput = $currentTheme === 'light' ? 'dark' : 'light';
+    }
+
+    if (!in_array($themeInput, ['light', 'dark', 'auto'], true)) {
+        $themeInput = 'light';
+    }
+
+    $_SESSION['theme'] = $themeInput;
     $redirectTo = safe_redirect_target($_POST['redirect_to'] ?? null, 'index.php');
     redirect($redirectTo);
 }
@@ -1880,7 +1895,7 @@ if ($action === 'add_ip') {
     } catch (PDOException) {
         flash('La IP ya existe.', 'error');
     }
-    redirect('index.php?view=ips');
+    redirect($returnTo);
 }
 
 if ($action === 'scan_job_status') {
@@ -1946,9 +1961,10 @@ if ($action === 'scan_segment') {
 
 if ($action === 'save_ip') {
     $ip = trim((string) ($_POST['ip_address'] ?? ''));
+    $returnTo = safe_redirect_target((string) ($_POST['return_to'] ?? ''), 'index.php?view=ips');
     if (!validate_ip($ip)) {
         flash('IP inválida.', 'error');
-        redirect('index.php');
+        redirect($returnTo);
     }
 
     $hostType = normalize_host_type_label((string) ($_POST['host_type'] ?? ''));
@@ -2238,6 +2254,9 @@ $baseQueryParams = [
     'status_filter' => $statusFilterInput,
     'per_page' => (string) $perPageInput,
 ];
+$listStateQuery = $baseQueryParams;
+$listStateQuery['page'] = (string) $currentPage;
+$listStateUrl = 'index.php?' . http_build_query($listStateQuery);
 
 
 $segmentStats = [];
@@ -2342,11 +2361,21 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         </div>
         <div class="top-actions">
             <span class="pill">Perfil (<?= h($displayName) ?>)</span>
-            <form method="post">
-                <input type="hidden" name="action" value="toggle_theme">
-                <input type="hidden" name="redirect_to" value="<?= h($currentUrl) ?>">
-                <button class="btn">Modo <?= $theme === 'light' ? 'nocturno' : 'claro' ?></button>
-            </form>
+            <details class="settings-menu theme-menu">
+                <summary class="btn">Tema: <?= h(ucfirst($theme)) ?></summary>
+                <div class="settings-panel menu-panel theme-panel">
+                    <?php foreach (['light' => 'Light', 'dark' => 'Dark', 'auto' => 'Auto'] as $themeValue => $themeLabel): ?>
+                        <form method="post" class="theme-option-form">
+                            <input type="hidden" name="action" value="set_theme">
+                            <input type="hidden" name="theme" value="<?= h($themeValue) ?>">
+                            <input type="hidden" name="redirect_to" value="<?= h($currentUrl) ?>">
+                            <button class="btn small <?= $theme === $themeValue ? 'primary' : 'ghost' ?>" type="submit">
+                                <?= h($themeLabel) ?><?= $theme === $themeValue ? ' ✓' : '' ?>
+                            </button>
+                        </form>
+                    <?php endforeach; ?>
+                </div>
+            </details>
             <?php if ($user['role'] === ROLE_ADMIN): ?>
                 <details class="settings-menu">
                     <summary class="btn">Mantenimiento</summary>
@@ -2509,7 +2538,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
 
     <?php if ($view === 'ips'): ?>
         <?php if (in_array($user['role'], [ROLE_ADMIN, ROLE_OPERATOR], true)): ?>
-        <details class="card collapsible-card" open>
+        <details class="card collapsible-card">
             <summary><h2>Registrar IP</h2></summary>
             <form method="post" class="form-grid three">
                 <input type="hidden" name="action" value="add_ip" />
@@ -2522,7 +2551,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         </details>
 
         <?php if ($user['role'] === ROLE_ADMIN): ?>
-        <details class="card collapsible-card" open>
+        <details class="card collapsible-card">
             <summary><h2>Escanear segmento (/24)</h2></summary>
             <form method="post" class="form-grid three">
                 <input type="hidden" name="action" value="scan_segment" />
@@ -2595,7 +2624,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                         <tr><td colspan="5">No hay IPs registradas.</td></tr>
                     <?php else: ?>
                         <?php foreach ($rows as $row): ?>
-                            <tr data-ip-row="<?= h($row['ip_address']) ?>">
+                            <tr id="<?= h(ip_anchor_id((string) $row['ip_address'])) ?>" data-ip-row="<?= h($row['ip_address']) ?>">
                                 <td class="cell-clip" title="<?= h($row['ip_address']) ?>">
                                     <strong><?= h($row['ip_address']) ?></strong>
                                     <details class="row-extra">
@@ -2616,7 +2645,8 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                     <div class="muted js-last-ping"><?= h($row['last_ping_at'] ? format_display_datetime($row['last_ping_at']) : 'Nunca') ?></div>
                                 </td>
                                 <td class="actions-col">
-                                    <a class="btn small" href="index.php?view=ips&amp;action=detail&amp;ip=<?= urlencode($row['ip_address']) ?>">Detalles</a>
+                                    <?php $detailQuery = $listStateQuery; $detailQuery['action'] = 'detail'; $detailQuery['ip'] = $row['ip_address']; ?>
+                                    <a class="btn small" href="index.php?<?= h(http_build_query($detailQuery)) ?>#<?= h(ip_anchor_id((string) $row['ip_address'])) ?>">Detalles</a>
                                     <form method="post" class="js-ping-now-form">
                                         <input type="hidden" name="action" value="ping_now">
                                         <input type="hidden" name="ip_address" value="<?= h($row['ip_address']) ?>">
@@ -2667,10 +2697,11 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
             <div class="modal-backdrop">
             <section class="card modal-card">
                 <h2>Detalle de IP - <?= h($detail['ip_address']) ?></h2>
-                <a class="btn small ghost" href="index.php?view=ips">Cerrar</a>
+                <a class="btn small ghost" href="<?= h($listStateUrl) ?>#<?= h(ip_anchor_id((string) $detail['ip_address'])) ?>">Cerrar</a>
                 <form method="post" class="form-grid two">
                     <input type="hidden" name="action" value="save_ip" />
                     <input type="hidden" name="ip_address" value="<?= h($detail['ip_address']) ?>" />
+                    <input type="hidden" name="return_to" value="<?= h($listStateUrl) ?>#<?= h(ip_anchor_id((string) $detail['ip_address'])) ?>" />
                     <label>Alias<input type="text" name="alias" value="<?= h($detail['alias']) ?>"></label>
                     <label>Nombre<input type="text" name="host_name" value="<?= h($detail['host_name']) ?>"></label>
                     <label>Tipo

@@ -26,6 +26,22 @@ html[data-theme="dark"] {
     --shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
 }
 
+@media (prefers-color-scheme: dark) {
+    html[data-theme="auto"] {
+        --bg: #0f172a;
+        --card: rgba(15, 23, 42, 0.9);
+        --surface: rgba(30, 41, 59, 0.76);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --border: #334155;
+        --primary: #4f83ff;
+        --primary-strong: #79a3ff;
+        --success: #51cf66;
+        --error: #ff6b6b;
+        --shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    }
+}
+
 * { box-sizing: border-box; }
 body {
     margin: 0;
@@ -69,6 +85,21 @@ body:not(.login-page)::before {
 .settings-menu { position: relative; }
 .settings-menu summary { list-style: none; }
 .settings-menu summary::-webkit-details-marker { display: none; }
+.theme-menu .settings-panel {
+    width: 170px;
+}
+.theme-panel {
+    padding: 8px;
+    display: grid;
+    gap: 6px;
+}
+.theme-option-form {
+    margin: 0;
+}
+.theme-option-form .btn {
+    width: 100%;
+    justify-content: flex-start;
+}
 .settings-panel {
     position: absolute;
     right: 0;
