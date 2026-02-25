@@ -2008,7 +2008,7 @@ if ($action === 'save_ip') {
         'ip_address' => $ip,
     ]);
     flash('Datos actualizados.', 'success');
-    redirect('index.php?view=ips');
+    redirect($returnTo);
 }
 
 if ($action === 'add_user') {
