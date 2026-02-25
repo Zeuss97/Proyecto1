@@ -2435,16 +2435,17 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         </div>
         <div class="top-actions">
             <span class="pill">Perfil (<?= h($displayName) ?>)</span>
+            <?php
+            $themeOptions = [
+                'light' => ['label' => 'Light', 'icon' => '☀️'],
+                'dark' => ['label' => 'Dark', 'icon' => '🌙'],
+                'auto' => ['label' => 'Auto', 'icon' => '◐'],
+            ];
+            $currentThemeMeta = $themeOptions[$theme] ?? ['label' => ucfirst($theme), 'icon' => '◐'];
+            ?>
             <details class="settings-menu theme-menu">
-                <summary class="btn">Tema: <?= h(ucfirst($theme)) ?></summary>
+                <summary class="btn">Tema: <span class="theme-icon" aria-hidden="true"><?= h($currentThemeMeta['icon']) ?></span> <?= h($currentThemeMeta['label']) ?></summary>
                 <div class="settings-panel menu-panel theme-panel">
-                    <?php
-                    $themeOptions = [
-                        'light' => ['label' => 'Light', 'icon' => '☀️'],
-                        'dark' => ['label' => 'Dark', 'icon' => '🌙'],
-                        'auto' => ['label' => 'Auto', 'icon' => '◐'],
-                    ];
-                    ?>
                     <?php foreach ($themeOptions as $themeValue => $themeMeta): ?>
                         <form method="post" class="theme-option-form">
                             <input type="hidden" name="action" value="set_theme">
