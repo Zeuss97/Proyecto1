@@ -347,6 +347,7 @@ html[data-theme="dark"] textarea { background: rgba(15, 23, 42, 0.78); }
     transition: background-color .15s ease, border-color .15s ease, color .15s ease;
 }
 .btn:hover { transform: none; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
 .btn.primary { background: linear-gradient(180deg, var(--primary), var(--primary-strong)); border-color: transparent; color: #fff; }
 .btn.ghost { background: rgba(255,255,255,.25); }
 .btn.small { padding: 7px 11px; font-size: .92rem; }

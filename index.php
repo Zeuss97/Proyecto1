@@ -102,10 +102,18 @@ function init_db(): void
         username TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT "operator",
+        is_active INTEGER NOT NULL DEFAULT 1,
         first_name TEXT,
         last_name TEXT,
         created_at TEXT NOT NULL
     )');
+
+    $userColumns = $pdo->query('PRAGMA table_info(users)')->fetchAll();
+    $userColumnNames = array_column($userColumns, 'name');
+    if (!in_array('is_active', $userColumnNames, true)) {
+        $pdo->exec('ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
+        $pdo->exec('UPDATE users SET is_active = 1 WHERE is_active IS NULL');
+    }
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS ip_registry (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,9 +322,21 @@ function current_user(): ?array
         return null;
     }
 
-    $stmt = db()->prepare('SELECT username, role, first_name, last_name FROM users WHERE username = :username');
+    $stmt = db()->prepare('SELECT username, role, first_name, last_name, is_active FROM users WHERE username = :username');
     $stmt->execute(['username' => $_SESSION['username']]);
-    return $stmt->fetch() ?: null;
+    $current = $stmt->fetch() ?: null;
+    if ($current !== null && (int) ($current['is_active'] ?? 1) !== 1) {
+        unset($_SESSION['username']);
+        flash('Tu usuario está desactivado. Contacta a un administrador.', 'error');
+        return null;
+    }
+    return $current;
+}
+
+function count_active_admins(): int
+{
+    $stmt = db()->query('SELECT COUNT(*) FROM users WHERE role = "admin" AND is_active = 1');
+    return (int) $stmt->fetchColumn();
 }
 
 function flash(?string $message = null, string $type = 'info'): ?array
@@ -1663,13 +1683,17 @@ if ($action === 'login') {
     $username = trim((string) ($_POST['username'] ?? ''));
     $password = (string) ($_POST['password'] ?? '');
 
-    $stmt = db()->prepare('SELECT username, password_hash FROM users WHERE username = :username');
+    $stmt = db()->prepare('SELECT username, password_hash, is_active FROM users WHERE username = :username');
     $stmt->execute(['username' => $username]);
     $row = $stmt->fetch();
 
     if ($row && password_verify($password, $row['password_hash'])) {
-        $_SESSION['username'] = $row['username'];
-        flash('Bienvenido, ' . $row['username'] . '.', 'success');
+        if ((int) ($row['is_active'] ?? 1) !== 1) {
+            flash('Usuario desactivado. Contacta a un administrador.', 'error');
+        } else {
+            $_SESSION['username'] = $row['username'];
+            flash('Bienvenido, ' . $row['username'] . '.', 'success');
+        }
     } else {
         flash('Credenciales inválidas.', 'error');
     }
@@ -2067,6 +2091,56 @@ if ($action === 'update_user') {
     redirect('index.php');
 }
 
+if ($action === 'toggle_user_active') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede activar o desactivar usuarios.', 'error');
+        redirect('index.php');
+    }
+
+    $username = trim((string) ($_POST['username'] ?? ''));
+    $desiredState = (int) ($_POST['is_active'] ?? 0) === 1 ? 1 : 0;
+
+    if ($username === '') {
+        flash('Debe seleccionar un usuario.', 'error');
+        redirect('index.php?modal=list_users');
+    }
+
+    $userStmt = db()->prepare('SELECT username, role, is_active FROM users WHERE username = :username');
+    $userStmt->execute(['username' => $username]);
+    $targetUser = $userStmt->fetch();
+    if (!$targetUser) {
+        flash('El usuario indicado no existe.', 'error');
+        redirect('index.php?modal=list_users');
+    }
+
+    $currentState = (int) ($targetUser['is_active'] ?? 1) === 1 ? 1 : 0;
+    if ($currentState === $desiredState) {
+        flash($desiredState === 1 ? 'El usuario ya está activo.' : 'El usuario ya está desactivado.', 'info');
+        redirect('index.php?modal=list_users');
+    }
+
+    if ($desiredState === 0 && (string) ($targetUser['role'] ?? '') === ROLE_ADMIN && count_active_admins() <= 1) {
+        flash('No se puede desactivar al último administrador activo.', 'error');
+        redirect('index.php?modal=list_users');
+    }
+
+    $update = db()->prepare('UPDATE users SET is_active = :is_active WHERE username = :username');
+    $update->execute([
+        'is_active' => $desiredState,
+        'username' => $username,
+    ]);
+
+    if ($desiredState === 0 && $username === (string) $user['username']) {
+        session_destroy();
+        session_start();
+        flash('Tu usuario fue desactivado.', 'info');
+        redirect('index.php');
+    }
+
+    flash($desiredState === 1 ? 'Usuario activado correctamente.' : 'Usuario desactivado correctamente.', 'success');
+    redirect('index.php?modal=list_users');
+}
+
 if ($action === 'reset_user_password') {
     if ($user['role'] !== ROLE_ADMIN) {
         flash('Solo admin puede recuperar contraseñas.', 'error');
@@ -2334,7 +2408,7 @@ $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
 if ($user['role'] === ROLE_ADMIN) {
-    $usersList = db()->query('SELECT username, role, first_name, last_name FROM users ORDER BY username')->fetchAll();
+    $usersList = db()->query('SELECT username, role, first_name, last_name, is_active FROM users ORDER BY username')->fetchAll();
 }
 $modal = trim((string) ($_GET['modal'] ?? ''));
 $showCreateUserModal = $user['role'] === ROLE_ADMIN && $modal === 'create_user';
@@ -2902,16 +2976,45 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <a class="btn small ghost" href="index.php">Cerrar</a>
                 <div class="table-wrap">
                     <table>
-                        <thead><tr><th>Usuario</th><th>Nombre</th><th>Rol</th></tr></thead>
+                        <thead><tr><th>Usuario</th><th>Nombre</th><th>Rol</th><th>Estado</th><th>Acción</th></tr></thead>
                         <tbody>
+                        <?php $activeAdminsCount = count_active_admins(); ?>
                         <?php if (!$usersList): ?>
-                            <tr><td colspan="3">No hay usuarios.</td></tr>
+                            <tr><td colspan="5">No hay usuarios.</td></tr>
                         <?php else: ?>
                             <?php foreach ($usersList as $usr): ?>
+                                <?php
+                                $usrIsActive = (int) ($usr['is_active'] ?? 1) === 1;
+                                $isAdminRow = (string) ($usr['role'] ?? '') === ROLE_ADMIN;
+                                $isLastActiveAdmin = $isAdminRow && $usrIsActive && $activeAdminsCount <= 1;
+                                $toggleTo = $usrIsActive ? 0 : 1;
+                                $toggleLabel = $usrIsActive ? 'Desactivar' : 'Activar';
+                                $confirmMessage = $usrIsActive
+                                    ? '¿Desactivar este usuario?'
+                                    : '¿Activar este usuario?';
+                                if ($isLastActiveAdmin) {
+                                    $confirmMessage = 'Advertencia: este es el último administrador activo y no se puede desactivar.';
+                                }
+                                ?>
                                 <tr>
                                     <td><?= h($usr['username']) ?></td>
                                     <td><?= h(trim(($usr['first_name'] ?? '') . ' ' . ($usr['last_name'] ?? '')) ?: '-') ?></td>
                                     <td><?= h($usr['role']) ?></td>
+                                    <td>
+                                        <span class="status-pill <?= $usrIsActive ? 'ok' : 'unknown' ?>">
+                                            <?= $usrIsActive ? 'Activo' : 'Desactivado' ?>
+                                        </span>
+                                    </td>
+                                    <td class="actions-col">
+                                        <form method="post" onsubmit="return confirm('<?= h($confirmMessage) ?>');">
+                                            <input type="hidden" name="action" value="toggle_user_active" />
+                                            <input type="hidden" name="username" value="<?= h($usr['username']) ?>" />
+                                            <input type="hidden" name="is_active" value="<?= $toggleTo ?>" />
+                                            <button type="submit" class="btn small <?= $usrIsActive ? 'ghost' : 'primary' ?>" <?= $isLastActiveAdmin ? 'disabled' : '' ?>>
+                                                <?= h($toggleLabel) ?>
+                                            </button>
+                                        </form>
+                                    </td>
                                 </tr>
                             <?php endforeach; ?>
                         <?php endif; ?>
