@@ -1756,6 +1756,27 @@ function process_pending_scan_slice_for_maintenance(int $batchHosts = 8): void
     run_scan_job_slice((int) $job['id'], $batchHosts);
 }
 
+function kick_scan_job_progress(array $job, int $batchHosts = 8): array
+{
+    if (($job['job_type'] ?? '') !== 'scan_segment') {
+        return $job;
+    }
+
+    ensure_scan_job_kicked($job);
+    $jobId = (int) ($job['id'] ?? 0);
+    if ($jobId <= 0) {
+        return $job;
+    }
+
+    $fresh = get_background_job($jobId) ?? $job;
+    if (should_process_scan_slice($fresh, 1)) {
+        run_scan_job_slice($jobId, $batchHosts);
+        $fresh = get_background_job($jobId) ?? $fresh;
+    }
+
+    return $fresh;
+}
+
 function launch_general_worker(): bool
 {
     $phpBin = resolve_php_cli_binary();
@@ -2130,8 +2151,7 @@ if ($action === 'scan_job_status') {
         json_response(['ok' => false, 'message' => 'No hay escaneo activo.'], 404);
     }
 
-    ensure_scan_job_kicked($job);
-    $job = get_background_job((int) $job['id']) ?? $job;
+    $job = kick_scan_job_progress($job, 8);
 
     $result = json_decode((string) ($job['result_json'] ?? ''), true);
     if (!is_array($result)) {
@@ -2222,8 +2242,13 @@ if ($action === 'scan_segment') {
     }
 
     $active = get_latest_active_scan_job();
+    if ($active !== null && is_background_job_stale($active, SCAN_STALE_JOB_SECONDS)) {
+        cancel_scan_job((int) ($active['id'] ?? 0), 'Escaneo marcado como bloqueado por inactividad.', 'system-auto');
+        $active = null;
+    }
+
     if ($active !== null) {
-        flash('Ya hay un escaneo en ejecución. Espera a que finalice.', 'info');
+        flash('Ya hay un escaneo en ejecución. Espera a que finalice o cancélalo desde la tarjeta de progreso.', 'info');
         redirect('index.php?view=ips');
     }
 
