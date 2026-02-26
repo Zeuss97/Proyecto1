@@ -15,6 +15,7 @@ const AUTO_SCAN_SEGMENT_KEY = 'auto_scan_segment';
 const SCAN_POOL_SIZE_KEY = 'scan_pool_size';
 const SCAN_DEFAULT_TIMEOUT_MS_KEY = 'scan_default_timeout_ms';
 const SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY = 'scan_segment_timeout_max_ms';
+const SCAN_RTT_BACKOFF_FACTOR_KEY = 'scan_rtt_backoff_factor';
 const SCAN_POOL_SIZE_DEFAULT = 100;
 const SCAN_TIMEOUT_MIN_MS = 300;
 const SCAN_TIMEOUT_MAX_MS = 2000;
@@ -23,6 +24,10 @@ const MANUAL_PING_TIMEOUT_MAX_MS = 900;
 const SEGMENT_SCAN_TIMEOUT_MIN_MS = 180;
 const SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT = 2000;
 const SEGMENT_SCAN_MAX_DURATION_MS = 90000;
+const SCAN_RTT_BACKOFF_FACTOR_DEFAULT = 3;
+const SCAN_RTT_BACKOFF_FACTOR_MIN = 2;
+const SCAN_RTT_BACKOFF_FACTOR_MAX = 6;
+const SCAN_JOB_LOG_LIMIT = 80;
 const TCP_FALLBACK_PORT = 80;
 const PING_ALL_BATCH_SIZE = 24;
 const PING_ALL_POOL_SIZE_MAX = 64;
@@ -261,6 +266,11 @@ function get_manual_ping_timeout_ms(): int
 function get_scan_segment_timeout_max_ms(): int
 {
     return get_app_setting_int(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT, SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+}
+
+function get_scan_rtt_backoff_factor(): int
+{
+    return get_app_setting_int(SCAN_RTT_BACKOFF_FACTOR_KEY, SCAN_RTT_BACKOFF_FACTOR_DEFAULT, SCAN_RTT_BACKOFF_FACTOR_MIN, SCAN_RTT_BACKOFF_FACTOR_MAX);
 }
 
 
@@ -747,10 +757,11 @@ function scan_ips_parallel(array $ips, int $poolSize, ?callable $onResult = null
             break;
         }
 
+        $backoffFactor = get_scan_rtt_backoff_factor();
         $sampleAvg = $rttSamples === []
-            ? get_scan_default_timeout_ms() / 3
+            ? get_scan_default_timeout_ms() / $backoffFactor
             : array_sum($rttSamples) / count($rttSamples);
-        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * 3), SEGMENT_SCAN_TIMEOUT_MIN_MS, get_scan_segment_timeout_max_ms());
+        $dynamicTimeoutMs = clamp_int((int) round($sampleAvg * $backoffFactor), SEGMENT_SCAN_TIMEOUT_MIN_MS, get_scan_segment_timeout_max_ms());
 
         while ($queue !== [] && count($running) < $poolSize) {
             $ip = array_shift($queue);
@@ -1108,7 +1119,10 @@ function create_background_job(string $type, array $payload, string $createdBy):
         'updated_at' => $now,
     ]);
 
-    return (int) db()->lastInsertId();
+    $jobId = (int) db()->lastInsertId();
+    append_background_job_log($jobId, 'Job creado: ' . $message, 'info');
+
+    return $jobId;
 }
 
 function get_background_job(int $jobId): ?array
@@ -1128,6 +1142,15 @@ function get_latest_active_scan_job(): ?array
     return $row ?: null;
 }
 
+function get_latest_failed_scan_job(): ?array
+{
+    $stmt = db()->query('SELECT * FROM background_jobs
+        WHERE job_type = "scan_segment" AND status = "failed"
+        ORDER BY id DESC LIMIT 1');
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
 function get_latest_active_ping_all_job(): ?array
 {
     $stmt = db()->query('SELECT * FROM background_jobs
@@ -1135,6 +1158,50 @@ function get_latest_active_ping_all_job(): ?array
         ORDER BY id DESC LIMIT 1');
     $row = $stmt->fetch();
     return $row ?: null;
+}
+
+function append_background_job_log(int $jobId, string $message, string $level = 'info'): void
+{
+    $text = trim($message);
+    if ($jobId <= 0 || $text === '') {
+        return;
+    }
+
+    $job = get_background_job($jobId);
+    if ($job === null) {
+        return;
+    }
+
+    $result = json_decode((string) ($job['result_json'] ?? ''), true);
+    if (!is_array($result)) {
+        $result = [];
+    }
+
+    $logs = $result['logs'] ?? [];
+    if (!is_array($logs)) {
+        $logs = [];
+    }
+
+    $logs[] = [
+        'at' => now_iso(),
+        'level' => $level,
+        'message' => $text,
+    ];
+
+    if (count($logs) > SCAN_JOB_LOG_LIMIT) {
+        $logs = array_slice($logs, -SCAN_JOB_LOG_LIMIT);
+    }
+
+    $result['logs'] = array_values($logs);
+
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET result_json = :result_json, updated_at = :updated_at
+        WHERE id = :id');
+    $stmt->execute([
+        'result_json' => json_encode($result, JSON_UNESCAPED_UNICODE),
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
 }
 
 function update_background_job_progress(int $jobId, int $progress, int $total, string $message): void
@@ -1153,6 +1220,33 @@ function update_background_job_progress(int $jobId, int $progress, int $total, s
 
 function finish_background_job(int $jobId, string $status, array $result, string $message): void
 {
+    $existing = get_background_job($jobId);
+    $existingResult = json_decode((string) (($existing['result_json'] ?? '') ?: ''), true);
+    if (!is_array($existingResult)) {
+        $existingResult = [];
+    }
+
+    $logs = $existingResult['logs'] ?? [];
+    if (!is_array($logs)) {
+        $logs = [];
+    }
+
+    if (trim($message) !== '') {
+        $logs[] = [
+            'at' => now_iso(),
+            'level' => $status === 'failed' ? 'error' : 'info',
+            'message' => trim($message),
+        ];
+    }
+
+    if (count($logs) > SCAN_JOB_LOG_LIMIT) {
+        $logs = array_slice($logs, -SCAN_JOB_LOG_LIMIT);
+    }
+
+    if ($logs !== []) {
+        $result['logs'] = array_values($logs);
+    }
+
     $stmt = db()->prepare('UPDATE background_jobs
         SET status = :status, result_json = :result_json, message = :message, updated_at = :updated_at
         WHERE id = :id');
@@ -1367,7 +1461,9 @@ function ensure_scan_job_kicked(array $job): void
     }
 
     if (!launch_scan_job_worker($jobId) && $age >= 10) {
-        update_background_job_progress($jobId, 0, 254, 'No se pudo iniciar el worker automáticamente. Verifica permisos de exec/proc_open en PHP.');
+        $warn = 'No se pudo iniciar el worker automáticamente. Verifica permisos de exec/proc_open en PHP.';
+        update_background_job_progress($jobId, 0, 254, $warn);
+        append_background_job_log($jobId, $warn, 'error');
     }
 }
 
@@ -1397,6 +1493,7 @@ function run_scan_job_worker(int $jobId): void
     }
 
     update_background_job_progress($jobId, 0, 254, 'Iniciando escaneo...');
+    append_background_job_log($jobId, 'Iniciando escaneo completo del segmento.', 'info');
 
     try {
         $stats = run_segment_scan($prefix, $createdBy, static function (int $progress, int $total, string $message) use ($jobId): void {
@@ -1478,7 +1575,9 @@ function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
         $ips[] = $prefix . '.' . $host;
     }
 
-    update_background_job_progress($jobId, $nextHost - 1, 254, sprintf('Escaneando %s.%d-%d', $prefix, $nextHost, $endHost));
+    $sliceMessage = sprintf('Escaneando %s.%d-%d', $prefix, $nextHost, $endHost);
+    update_background_job_progress($jobId, $nextHost - 1, 254, $sliceMessage);
+    append_background_job_log($jobId, $sliceMessage, 'info');
 
     $scanResults = scan_ips_parallel($ips, get_scan_pool_size());
     foreach ($ips as $ip) {
@@ -1654,7 +1753,9 @@ function maybe_kick_background_worker(): void
     // Fallback web: evita que un escaneo quede en cola permanente
     // si no se puede lanzar el worker CLI por restricciones del entorno.
     if (!can_run_parallel_scan()) {
-        finish_background_job((int) ($activeScan['id'] ?? 0), 'failed', [], 'Escaneo no disponible: proc_open está deshabilitado en PHP.');
+        $jobId = (int) ($activeScan['id'] ?? 0);
+        append_background_job_log($jobId, 'No se puede ejecutar el fallback web: proc_open deshabilitado.', 'error');
+        finish_background_job($jobId, 'failed', [], 'Escaneo no disponible: proc_open está deshabilitado en PHP.');
         return;
     }
 
@@ -1839,10 +1940,12 @@ if ($action === 'save_scan_profile') {
     $poolSize = clamp_int((int) ($_POST['scan_pool_size'] ?? SCAN_POOL_SIZE_DEFAULT), 1, 256);
     $defaultTimeout = clamp_int((int) ($_POST['scan_default_timeout_ms'] ?? DEFAULT_SCAN_TIMEOUT_MS), SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
     $segmentTimeoutMax = clamp_int((int) ($_POST['scan_segment_timeout_max_ms'] ?? SEGMENT_SCAN_TIMEOUT_MAX_MS_DEFAULT), SEGMENT_SCAN_TIMEOUT_MIN_MS, SCAN_TIMEOUT_MAX_MS);
+    $rttBackoffFactor = clamp_int((int) ($_POST['scan_rtt_backoff_factor'] ?? SCAN_RTT_BACKOFF_FACTOR_DEFAULT), SCAN_RTT_BACKOFF_FACTOR_MIN, SCAN_RTT_BACKOFF_FACTOR_MAX);
 
     set_app_setting(SCAN_POOL_SIZE_KEY, (string) $poolSize);
     set_app_setting(SCAN_DEFAULT_TIMEOUT_MS_KEY, (string) $defaultTimeout);
     set_app_setting(SCAN_SEGMENT_TIMEOUT_MAX_MS_KEY, (string) $segmentTimeoutMax);
+    set_app_setting(SCAN_RTT_BACKOFF_FACTOR_KEY, (string) $rttBackoffFactor);
 
     flash('Perfil de escaneo actualizado.', 'success');
     redirect('index.php');
@@ -2002,6 +2105,37 @@ if ($action === 'scan_job_status') {
         'message' => (string) ($job['message'] ?? ''),
         'result' => $result,
     ]);
+}
+
+if ($action === 'retry_scan_job') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede reintentar escaneos.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $active = get_latest_active_scan_job();
+    if ($active !== null) {
+        flash('Ya hay un escaneo en ejecución. Espera a que finalice.', 'info');
+        redirect('index.php?view=ips');
+    }
+
+    $prefix = resolve_scan_segment_prefix((string) ($_POST['prefix'] ?? ''));
+    if ($prefix === null) {
+        flash('No se pudo reintentar: segmento inválido.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $jobId = create_background_job('scan_segment', [
+        'prefix' => $prefix,
+        'created_by' => $user['username'],
+        'next_host' => 1,
+    ], $user['username']);
+    append_background_job_log($jobId, 'Reintento manual solicitado por ' . $user['username'] . '.', 'info');
+    launch_scan_job_worker($jobId);
+
+    flash('Reintento de escaneo iniciado.', 'success');
+    $segmentOctet = explode('.', $prefix)[2] ?? '';
+    redirect('index.php?view=ips&segment=' . urlencode((string) $segmentOctet));
 }
 
 if ($action === 'scan_segment') {
@@ -2453,9 +2587,11 @@ $scanProfile = [
     'pool_size' => get_scan_pool_size(),
     'default_timeout_ms' => get_scan_default_timeout_ms(),
     'segment_timeout_max_ms' => get_scan_segment_timeout_max_ms(),
+    'rtt_backoff_factor' => get_scan_rtt_backoff_factor(),
 ];
 $hostTypes = get_host_types();
 $activeScanJob = get_latest_active_scan_job();
+$latestFailedScanJob = $activeScanJob === null ? get_latest_failed_scan_job() : null;
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -2548,6 +2684,9 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                                     <label>Timeout máximo escaneo segmento (ms)
                                         <input type="number" min="<?= h((string) SEGMENT_SCAN_TIMEOUT_MIN_MS) ?>" max="<?= h((string) SCAN_TIMEOUT_MAX_MS) ?>" name="scan_segment_timeout_max_ms" value="<?= h((string) $scanProfile['segment_timeout_max_ms']) ?>">
                                     </label>
+                                    <label>Backoff RTT (x)
+                                        <input type="number" min="<?= h((string) SCAN_RTT_BACKOFF_FACTOR_MIN) ?>" max="<?= h((string) SCAN_RTT_BACKOFF_FACTOR_MAX) ?>" name="scan_rtt_backoff_factor" value="<?= h((string) $scanProfile['rtt_backoff_factor']) ?>">
+                                    </label>
                                     <button type="submit" class="btn small">Guardar</button>
                                 </form>
                             </div>
@@ -2585,6 +2724,14 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         $jobTotal = max(1, (int) ($activeScanJob['total'] ?? 0));
         $jobProgress = (int) ($activeScanJob['progress'] ?? 0);
         $jobPct = (int) round(min(100, max(0, ($jobProgress / $jobTotal) * 100)));
+        $activeResult = json_decode((string) ($activeScanJob['result_json'] ?? ''), true);
+        if (!is_array($activeResult)) {
+            $activeResult = [];
+        }
+        $activeLogs = $activeResult['logs'] ?? [];
+        if (!is_array($activeLogs)) {
+            $activeLogs = [];
+        }
         ?>
         <section class="card" id="scan-progress-card" data-job-id="<?= h((string) $activeScanJob['id']) ?>">
             <div class="card-title-row">
@@ -2596,6 +2743,67 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <div id="scan-progress-bar" style="height:100%; width:<?= h((string) $jobPct) ?>%; background:linear-gradient(90deg,var(--primary),var(--primary-strong));"></div>
             </div>
             <div class="muted" id="scan-progress-counter" style="margin-top:6px;"><?= h((string) $jobProgress) ?> / <?= h((string) $jobTotal) ?> hosts</div>
+            <details class="scan-log-panel" style="margin-top:10px;">
+                <summary>Ver logs del escaneo</summary>
+                <ul class="scan-log-list" id="scan-job-log-list">
+                    <?php if ($activeLogs === []): ?>
+                        <li class="muted">Aún no hay logs.</li>
+                    <?php else: ?>
+                        <?php foreach ($activeLogs as $log): ?>
+                            <li>
+                                <strong>[<?= h(format_display_datetime((string) ($log['at'] ?? ''))) ?>]</strong>
+                                <?= h((string) ($log['message'] ?? '')) ?>
+                            </li>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </ul>
+            </details>
+        </section>
+    <?php elseif ($latestFailedScanJob): ?>
+        <?php
+        $failedPayload = json_decode((string) ($latestFailedScanJob['payload_json'] ?? ''), true);
+        if (!is_array($failedPayload)) {
+            $failedPayload = [];
+        }
+        $failedPrefix = resolve_scan_segment_prefix((string) ($failedPayload['prefix'] ?? ''));
+        $failedResult = json_decode((string) ($latestFailedScanJob['result_json'] ?? ''), true);
+        if (!is_array($failedResult)) {
+            $failedResult = [];
+        }
+        $failedLogs = $failedResult['logs'] ?? [];
+        if (!is_array($failedLogs)) {
+            $failedLogs = [];
+        }
+        ?>
+        <section class="card">
+            <div class="card-title-row">
+                <h2>Último escaneo fallido</h2>
+                <span class="status-pill error">Fallido</span>
+            </div>
+            <div class="muted"><?= h((string) ($latestFailedScanJob['message'] ?? 'Sin detalle')) ?></div>
+            <div class="muted" style="margin-top:6px;">Actualizado: <?= h(format_display_datetime((string) ($latestFailedScanJob['updated_at'] ?? ''))) ?></div>
+            <?php if ($failedPrefix !== null): ?>
+                <form method="post" style="margin-top:10px;">
+                    <input type="hidden" name="action" value="retry_scan_job" />
+                    <input type="hidden" name="prefix" value="<?= h($failedPrefix) ?>" />
+                    <button type="submit" class="btn small primary">Reintentar escaneo</button>
+                </form>
+            <?php endif; ?>
+            <details class="scan-log-panel" style="margin-top:10px;">
+                <summary>Ver logs del último fallo</summary>
+                <ul class="scan-log-list">
+                    <?php if ($failedLogs === []): ?>
+                        <li class="muted">Sin logs disponibles.</li>
+                    <?php else: ?>
+                        <?php foreach ($failedLogs as $log): ?>
+                            <li>
+                                <strong>[<?= h(format_display_datetime((string) ($log['at'] ?? ''))) ?>]</strong>
+                                <?= h((string) ($log['message'] ?? '')) ?>
+                            </li>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </ul>
+            </details>
         </section>
     <?php endif; ?>
 
@@ -3100,6 +3308,22 @@ document.addEventListener('DOMContentLoaded', () => {
         const progressLabel = document.getElementById('scan-progress-label');
         const progressCounter = document.getElementById('scan-progress-counter');
         const progressMessage = document.getElementById('scan-progress-message');
+        const progressLogList = document.getElementById('scan-job-log-list');
+
+        const renderLogs = (logs) => {
+            if (!progressLogList || !Array.isArray(logs)) {
+                return;
+            }
+            if (logs.length === 0) {
+                progressLogList.innerHTML = '<li class="muted">Aún no hay logs.</li>';
+                return;
+            }
+            progressLogList.innerHTML = logs.map((entry) => {
+                const at = String(entry.at || '');
+                const message = String(entry.message || '');
+                return '<li><strong>[' + at.replace(/</g, '&lt;').replace(/>/g, '&gt;') + ']</strong> ' + message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>';
+            }).join('');
+        };
 
         const poll = async () => {
             try {
@@ -3125,6 +3349,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (progressLabel) progressLabel.textContent = pct + '%';
                 if (progressCounter) progressCounter.textContent = progress + ' / ' + total + ' hosts';
                 if (progressMessage) progressMessage.textContent = data.message || 'Procesando...';
+                if (data.result && Array.isArray(data.result.logs)) {
+                    renderLogs(data.result.logs);
+                }
 
                 if (data.status === 'completed' || data.status === 'failed') {
                     setTimeout(() => window.location.reload(), 1200);

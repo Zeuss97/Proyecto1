@@ -388,6 +388,24 @@ html[data-theme="dark"] textarea { background: rgba(15, 23, 42, 0.78); }
     border-color: var(--border);
 }
 
+.scan-log-panel summary {
+    cursor: pointer;
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.scan-log-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    max-height: 180px;
+    overflow: auto;
+}
+
+.scan-log-list li {
+    margin-bottom: 4px;
+    font-size: .93rem;
+}
+
 .table-wrap { overflow:auto; }
 table { width:100%; border-collapse: collapse; table-layout: fixed; }
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align:left; vertical-align:top; }
