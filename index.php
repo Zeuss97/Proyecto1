@@ -1491,7 +1491,18 @@ function ensure_scan_job_kicked(array $job): void
         return;
     }
 
-    if (!launch_scan_job_worker($jobId) && $age >= 10) {
+    if (launch_scan_job_worker($jobId)) {
+        return;
+    }
+
+    // Fallback inmediato: si no se puede lanzar el worker CLI pero sí hay soporte
+    // para escaneo paralelo, avanzamos un slice desde el request actual.
+    if (can_run_parallel_scan()) {
+        run_scan_job_slice($jobId, 8);
+        return;
+    }
+
+    if ($age >= 10) {
         $warn = 'No se pudo iniciar el worker automáticamente. Verifica permisos de exec/proc_open en PHP.';
         update_background_job_progress($jobId, 0, 254, $warn);
         append_background_job_log($jobId, $warn, 'error');
