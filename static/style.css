@@ -26,6 +26,22 @@ html[data-theme="dark"] {
     --shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
 }
 
+@media (prefers-color-scheme: dark) {
+    html[data-theme="auto"] {
+        --bg: #0f172a;
+        --card: rgba(15, 23, 42, 0.9);
+        --surface: rgba(30, 41, 59, 0.76);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --border: #334155;
+        --primary: #4f83ff;
+        --primary-strong: #79a3ff;
+        --success: #51cf66;
+        --error: #ff6b6b;
+        --shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    }
+}
+
 * { box-sizing: border-box; }
 body {
     margin: 0;
@@ -69,6 +85,19 @@ body:not(.login-page)::before {
 .settings-menu { position: relative; }
 .settings-menu summary { list-style: none; }
 .settings-menu summary::-webkit-details-marker { display: none; }
+.theme-panel {
+    padding: 8px;
+    display: grid;
+    gap: 6px;
+}
+.theme-option-form {
+    margin: 0;
+}
+.theme-option-form .btn {
+    width: 100%;
+    justify-content: center;
+    gap: 6px;
+}
 .settings-panel {
     position: absolute;
     right: 0;
@@ -78,13 +107,15 @@ body:not(.login-page)::before {
     z-index: 25;
 }
 
+.theme-menu .settings-panel {
+    width: min(210px, 90vw);
+}
+
 .menu-panel {
     background: color-mix(in srgb, var(--surface) 90%, transparent);
     border: 1px solid var(--border);
     border-radius: 10px;
     overflow: visible;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
 }
 
 .menu-item {
@@ -157,8 +188,6 @@ body:not(.login-page)::before {
     border: 1px solid var(--border);
     border-radius: 8px;
     background: color-mix(in srgb, var(--surface) 92%, transparent);
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
     z-index: 40;
     box-shadow: var(--shadow);
 }
@@ -208,7 +237,8 @@ body:not(.login-page)::before {
     border-radius: 14px;
     padding: 16px;
     box-shadow: var(--shadow);
-    backdrop-filter: blur(4px);
+    content-visibility: auto;
+    contain-intrinsic-size: 420px;
 }
 
 .card h2 { margin-top: 0; margin-bottom: 12px; }
@@ -316,9 +346,10 @@ html[data-theme="dark"] textarea { background: rgba(15, 23, 42, 0.78); }
     display:inline-flex;
     align-items:center;
     justify-content:center;
-    transition: .15s ease;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
 }
-.btn:hover { transform: translateY(-1px); }
+.btn:hover { transform: none; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
 .btn.primary { background: linear-gradient(180deg, var(--primary), var(--primary-strong)); border-color: transparent; color: #fff; }
 .btn.ghost { background: rgba(255,255,255,.25); }
 .btn.small { padding: 7px 11px; font-size: .92rem; }
@@ -357,12 +388,56 @@ html[data-theme="dark"] textarea { background: rgba(15, 23, 42, 0.78); }
     border-color: var(--border);
 }
 
+.scan-log-panel summary {
+    cursor: pointer;
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.scan-log-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    max-height: 180px;
+    overflow: auto;
+}
+
+.scan-log-list li {
+    margin-bottom: 4px;
+    font-size: .93rem;
+}
+
 .table-wrap { overflow:auto; }
-table { width:100%; border-collapse: collapse; }
+table { width:100%; border-collapse: collapse; table-layout: fixed; }
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align:left; vertical-align:top; }
 th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: var(--muted); }
+.table-wrap table { will-change: auto; }
+
+.cell-clip {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.row-extra {
+    margin-top: 6px;
+}
+
+.row-extra > summary {
+    cursor: pointer;
+    color: var(--primary);
+    font-weight: 600;
+    list-style: none;
+}
+
+.row-extra > summary::-webkit-details-marker { display: none; }
 .muted { color: var(--muted); font-size: .95rem; margin-top:4px; }
-.actions-col { display:flex; gap:8px; flex-wrap:wrap; }
+td.actions-col { white-space: nowrap; }
+td.actions-col .btn,
+td.actions-col form {
+    display: inline-flex;
+    vertical-align: top;
+}
+td.actions-col form { margin: 0 0 0 8px; }
 
 .login-page { display:flex; justify-content:center; align-items:center; padding:20px; }
 .login-card {
@@ -374,6 +449,14 @@ th { text-transform: uppercase; letter-spacing:.05em; font-size: .86rem; color: 
     box-shadow: var(--shadow);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+    }
 }
 
 .modal-backdrop {
