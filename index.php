@@ -1165,6 +1165,17 @@ function finish_background_job(int $jobId, string $status, array $result, string
     ]);
 }
 
+function mark_background_job_running(int $jobId): void
+{
+    $stmt = db()->prepare('UPDATE background_jobs
+        SET status = "running", updated_at = :updated_at
+        WHERE id = :id AND status = "queued"');
+    $stmt->execute([
+        'updated_at' => now_iso(),
+        'id' => $jobId,
+    ]);
+}
+
 function prune_background_jobs(): void
 {
     $oldLimit = iso_after_seconds(-3 * 86400);
@@ -1249,6 +1260,9 @@ function build_php_cli_command(array $args): string
 function run_detached_command(string $command): bool
 {
     if (PHP_OS_FAMILY === 'Windows') {
+        if (!function_exists('popen')) {
+            return false;
+        }
         $winCmd = 'cmd /C start "" /B ' . $command . ' >NUL 2>NUL';
         $handle = @popen($winCmd, 'r');
         if (!is_resource($handle)) {
@@ -1258,8 +1272,17 @@ function run_detached_command(string $command): bool
         return true;
     }
 
+    if (!function_exists('exec')) {
+        return false;
+    }
+
     @exec($command . ' > /dev/null 2>&1 &', $output, $exitCode);
     return $exitCode === 0;
+}
+
+function can_run_parallel_scan(): bool
+{
+    return function_exists('proc_open');
 }
 
 function launch_scan_job_worker(int $jobId): bool
@@ -1368,6 +1391,11 @@ function run_scan_job_worker(int $jobId): void
         return;
     }
 
+    if (!can_run_parallel_scan()) {
+        finish_background_job($jobId, 'failed', [], 'Escaneo no disponible: proc_open está deshabilitado en PHP.');
+        return;
+    }
+
     update_background_job_progress($jobId, 0, 254, 'Iniciando escaneo...');
 
     try {
@@ -1402,6 +1430,10 @@ function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
         return;
     }
 
+    if ((string) ($job['status'] ?? '') === 'queued') {
+        mark_background_job_running($jobId);
+    }
+
     $payload = json_decode((string) ($job['payload_json'] ?? ''), true);
     if (!is_array($payload)) {
         finish_background_job($jobId, 'failed', [], 'Payload inválido');
@@ -1412,6 +1444,11 @@ function run_scan_job_slice(int $jobId, int $batchHosts = 16): void
     $createdBy = (string) ($payload['created_by'] ?? 'system');
     if ($prefix === '') {
         finish_background_job($jobId, 'failed', [], 'Segmento inválido');
+        return;
+    }
+
+    if (!can_run_parallel_scan()) {
+        finish_background_job($jobId, 'failed', [], 'Escaneo no disponible: proc_open está deshabilitado en PHP.');
         return;
     }
 
@@ -1606,7 +1643,22 @@ function maybe_kick_background_worker(): void
 
     if (launch_general_worker()) {
         set_app_setting('background_worker_last_kick_at', now_iso());
+        return;
     }
+
+    $activeScan = get_latest_active_scan_job();
+    if ($activeScan === null) {
+        return;
+    }
+
+    // Fallback web: evita que un escaneo quede en cola permanente
+    // si no se puede lanzar el worker CLI por restricciones del entorno.
+    if (!can_run_parallel_scan()) {
+        finish_background_job((int) ($activeScan['id'] ?? 0), 'failed', [], 'Escaneo no disponible: proc_open está deshabilitado en PHP.');
+        return;
+    }
+
+    process_pending_scan_slice_for_maintenance(4);
 }
 
 function run_background_maintenance(int $pingLimit = 1): void
