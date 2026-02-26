@@ -1191,6 +1191,20 @@ function cancel_scan_job(int $jobId, string $reason, string $actor = 'system'): 
     finish_background_job($jobId, 'failed', ['cancelled' => true], $reason);
 }
 
+function auto_release_stale_scan_job(string $actor = 'system-auto'): void
+{
+    $active = get_latest_active_scan_job();
+    if ($active === null) {
+        return;
+    }
+
+    if (!is_background_job_stale($active, SCAN_STALE_JOB_SECONDS)) {
+        return;
+    }
+
+    cancel_scan_job((int) ($active['id'] ?? 0), 'Escaneo marcado como bloqueado por inactividad.', $actor);
+}
+
 function append_background_job_log(int $jobId, string $message, string $level = 'info'): void
 {
     $text = trim($message);
@@ -1969,6 +1983,8 @@ if ($user === null) {
     exit;
 }
 
+auto_release_stale_scan_job('system-web');
+
 if ($action === 'set_wallpaper') {
     $choice = trim((string) ($_POST['wallpaper'] ?? ''));
     $allowed = list_wallpapers();
@@ -2145,6 +2161,7 @@ if ($action === 'scan_job_status') {
         session_write_close();
     }
 
+    auto_release_stale_scan_job('system-status');
     $jobId = (int) ($_GET['job_id'] ?? 0);
     $job = $jobId > 0 ? get_background_job($jobId) : get_latest_active_scan_job();
     if ($job === null || ($job['job_type'] ?? '') !== 'scan_segment') {
@@ -2198,11 +2215,8 @@ if ($action === 'retry_scan_job') {
         redirect('index.php?view=ips');
     }
 
+    auto_release_stale_scan_job('system-auto');
     $active = get_latest_active_scan_job();
-    if ($active !== null && is_background_job_stale($active, SCAN_STALE_JOB_SECONDS)) {
-        cancel_scan_job((int) ($active['id'] ?? 0), 'Escaneo marcado como bloqueado por inactividad.', 'system-auto');
-        $active = null;
-    }
 
     if ($active !== null) {
         flash('Ya hay un escaneo en ejecución. Espera a que finalice o cancélalo desde la tarjeta de progreso.', 'info');
@@ -2241,11 +2255,8 @@ if ($action === 'scan_segment') {
         redirect('index.php?view=ips');
     }
 
+    auto_release_stale_scan_job('system-auto');
     $active = get_latest_active_scan_job();
-    if ($active !== null && is_background_job_stale($active, SCAN_STALE_JOB_SECONDS)) {
-        cancel_scan_job((int) ($active['id'] ?? 0), 'Escaneo marcado como bloqueado por inactividad.', 'system-auto');
-        $active = null;
-    }
 
     if ($active !== null) {
         flash('Ya hay un escaneo en ejecución. Espera a que finalice o cancélalo desde la tarjeta de progreso.', 'info');
