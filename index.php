@@ -28,6 +28,7 @@ const SCAN_RTT_BACKOFF_FACTOR_DEFAULT = 3;
 const SCAN_RTT_BACKOFF_FACTOR_MIN = 2;
 const SCAN_RTT_BACKOFF_FACTOR_MAX = 6;
 const SCAN_JOB_LOG_LIMIT = 80;
+const SCAN_STALE_JOB_SECONDS = 120;
 const TCP_FALLBACK_PORT = 80;
 const PING_ALL_BATCH_SIZE = 24;
 const PING_ALL_POOL_SIZE_MAX = 64;
@@ -1160,6 +1161,36 @@ function get_latest_active_ping_all_job(): ?array
     return $row ?: null;
 }
 
+function is_background_job_stale(array $job, int $staleAfterSeconds = SCAN_STALE_JOB_SECONDS): bool
+{
+    if (!in_array((string) ($job['status'] ?? ''), ['queued', 'running'], true)) {
+        return false;
+    }
+
+    $updatedRaw = trim((string) ($job['updated_at'] ?? ''));
+    if ($updatedRaw === '') {
+        return true;
+    }
+
+    try {
+        $updatedAt = new DateTimeImmutable($updatedRaw);
+    } catch (Exception) {
+        return true;
+    }
+
+    return (time() - $updatedAt->getTimestamp()) >= $staleAfterSeconds;
+}
+
+function cancel_scan_job(int $jobId, string $reason, string $actor = 'system'): void
+{
+    if ($jobId <= 0) {
+        return;
+    }
+
+    append_background_job_log($jobId, 'Cancelado por ' . $actor . ': ' . $reason, 'error');
+    finish_background_job($jobId, 'failed', ['cancelled' => true], $reason);
+}
+
 function append_background_job_log(int $jobId, string $message, string $level = 'info'): void
 {
     $text = trim($message);
@@ -2107,6 +2138,29 @@ if ($action === 'scan_job_status') {
     ]);
 }
 
+if ($action === 'cancel_scan_job') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede cancelar escaneos.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $jobId = (int) ($_POST['job_id'] ?? 0);
+    $job = $jobId > 0 ? get_background_job($jobId) : get_latest_active_scan_job();
+    if ($job === null || (string) ($job['job_type'] ?? '') !== 'scan_segment' || !in_array((string) ($job['status'] ?? ''), ['queued', 'running'], true)) {
+        flash('No hay escaneo activo para cancelar.', 'info');
+        redirect('index.php?view=ips');
+    }
+
+    $reason = trim((string) ($_POST['cancel_reason'] ?? ''));
+    if ($reason === '') {
+        $reason = 'Escaneo cancelado manualmente.';
+    }
+
+    cancel_scan_job((int) ($job['id'] ?? 0), $reason, (string) ($user['username'] ?? 'admin'));
+    flash('Escaneo cancelado. Ya puedes iniciar otro.', 'success');
+    redirect('index.php?view=ips');
+}
+
 if ($action === 'retry_scan_job') {
     if ($user['role'] !== ROLE_ADMIN) {
         flash('Solo admin puede reintentar escaneos.', 'error');
@@ -2114,8 +2168,13 @@ if ($action === 'retry_scan_job') {
     }
 
     $active = get_latest_active_scan_job();
+    if ($active !== null && is_background_job_stale($active, SCAN_STALE_JOB_SECONDS)) {
+        cancel_scan_job((int) ($active['id'] ?? 0), 'Escaneo marcado como bloqueado por inactividad.', 'system-auto');
+        $active = null;
+    }
+
     if ($active !== null) {
-        flash('Ya hay un escaneo en ejecución. Espera a que finalice.', 'info');
+        flash('Ya hay un escaneo en ejecución. Espera a que finalice o cancélalo desde la tarjeta de progreso.', 'info');
         redirect('index.php?view=ips');
     }
 
@@ -2732,6 +2791,7 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         if (!is_array($activeLogs)) {
             $activeLogs = [];
         }
+        $activeIsStale = is_background_job_stale($activeScanJob, SCAN_STALE_JOB_SECONDS);
         ?>
         <section class="card" id="scan-progress-card" data-job-id="<?= h((string) $activeScanJob['id']) ?>">
             <div class="card-title-row">
@@ -2743,6 +2803,17 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
                 <div id="scan-progress-bar" style="height:100%; width:<?= h((string) $jobPct) ?>%; background:linear-gradient(90deg,var(--primary),var(--primary-strong));"></div>
             </div>
             <div class="muted" id="scan-progress-counter" style="margin-top:6px;"><?= h((string) $jobProgress) ?> / <?= h((string) $jobTotal) ?> hosts</div>
+            <div class="top-actions" style="margin-top:10px; gap:8px;">
+                <form method="post" onsubmit="return confirm('¿Cancelar este escaneo en segundo plano?');">
+                    <input type="hidden" name="action" value="cancel_scan_job" />
+                    <input type="hidden" name="job_id" value="<?= h((string) $activeScanJob['id']) ?>" />
+                    <input type="hidden" name="cancel_reason" value="Escaneo cancelado manualmente desde la interfaz." />
+                    <button type="submit" class="btn small ghost">Cancelar escaneo</button>
+                </form>
+                <?php if ($activeIsStale): ?>
+                    <span class="status-pill error">Posible bloqueo (&gt; <?= h((string) SCAN_STALE_JOB_SECONDS) ?>s sin actividad)</span>
+                <?php endif; ?>
+            </div>
             <details class="scan-log-panel" style="margin-top:10px;">
                 <summary>Ver logs del escaneo</summary>
                 <ul class="scan-log-list" id="scan-job-log-list">
