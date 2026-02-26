@@ -2209,6 +2209,21 @@ if ($action === 'cancel_scan_job') {
     redirect('index.php?view=ips');
 }
 
+if ($action === 'dismiss_failed_scan_card') {
+    if ($user['role'] !== ROLE_ADMIN) {
+        flash('Solo admin puede ocultar esta tarjeta.', 'error');
+        redirect('index.php?view=ips');
+    }
+
+    $jobId = (int) ($_POST['job_id'] ?? 0);
+    if ($jobId > 0) {
+        $_SESSION['dismissed_failed_scan_job_id'] = $jobId;
+    }
+
+    flash('Tarjeta de último escaneo fallido ocultada.', 'info');
+    redirect('index.php?view=ips');
+}
+
 if ($action === 'retry_scan_job') {
     if ($user['role'] !== ROLE_ADMIN) {
         flash('Solo admin puede reintentar escaneos.', 'error');
@@ -2697,7 +2712,14 @@ $scanProfile = [
 ];
 $hostTypes = get_host_types();
 $activeScanJob = get_latest_active_scan_job();
-$latestFailedScanJob = $activeScanJob === null ? get_latest_failed_scan_job() : null;
+$latestFailedScanJob = null;
+if ($user['role'] === ROLE_ADMIN && $activeScanJob === null) {
+    $latestFailedScanJob = get_latest_failed_scan_job();
+    $dismissedFailedScanJobId = (int) ($_SESSION['dismissed_failed_scan_job_id'] ?? 0);
+    if ($latestFailedScanJob !== null && (int) ($latestFailedScanJob['id'] ?? 0) <= $dismissedFailedScanJobId) {
+        $latestFailedScanJob = null;
+    }
+}
 $theme = $_SESSION['theme'] ?? 'light';
 $displayName = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: $user['username'];
 $usersList = [];
@@ -2896,7 +2918,14 @@ $currentUrl = 'index.php' . ($_GET ? ('?' . http_build_query($_GET)) : '');
         <section class="card">
             <div class="card-title-row">
                 <h2>Último escaneo fallido</h2>
-                <span class="status-pill error">Fallido</span>
+                <div class="top-actions" style="gap:8px;">
+                    <span class="status-pill error">Fallido</span>
+                    <form method="post">
+                        <input type="hidden" name="action" value="dismiss_failed_scan_card" />
+                        <input type="hidden" name="job_id" value="<?= h((string) ($latestFailedScanJob['id'] ?? 0)) ?>" />
+                        <button type="submit" class="btn small ghost">Ocultar</button>
+                    </form>
+                </div>
             </div>
             <div class="muted"><?= h((string) ($latestFailedScanJob['message'] ?? 'Sin detalle')) ?></div>
             <div class="muted" style="margin-top:6px;">Actualizado: <?= h(format_display_datetime((string) ($latestFailedScanJob['updated_at'] ?? ''))) ?></div>
